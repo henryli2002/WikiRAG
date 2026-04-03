@@ -96,27 +96,29 @@ def final_refine_wiki(input_file: str, output_file: str):
             if text != original_text:
                 modified_count += 1
 
-            # --- 步骤 E: 分类字段“语义级”净化 (解决 F\n, ㏼\n) ---
+            # --- 步骤 E: 分类字段“原子化净化” (解决 \\n, \n, 脏前缀) ---
             categories = data.get("categories", [])
             if categories:
-                raw_fragments = []
+                all_shards = []
                 for cat in categories:
-                    # 剁碎换行符并清洗碎片
-                    for p in cat.split('\n'):
-                        p_s = p.strip()
-                        # 质量门槛：长度>1 且必须包含字母/汉字/数字 (排除㏼等孤立符号)
-                        if len(p_s) > 1 and re.search(r'[\u4e00-\u9fa5a-zA-Z0-9]', p_s):
-                            raw_fragments.append(p_s)
+                    # 核心修改：使用正则同时拆分 换行符(\n) 和 字符串形式的双斜杠(\\n)
+                    # re.split(r'\\n|\n', cat) 能确保无论它怎么转义，都能切开
+                    shards = re.split(r'\\n|\n', cat)
+                    all_shards.extend(shards)
                 
-                # 语义去重：排除包含关系的脏数据
-                seen_fragments = list(dict.fromkeys(raw_fragments))
-                final_unique_cats = []
-                for i, candidate in enumerate(seen_fragments):
-                    # 如果当前碎片被包含在其他更长的碎片中，则视为冗余噪音
-                    if any(candidate in other and len(candidate) < len(other) for j, other in enumerate(seen_fragments) if i != j):
-                        continue
-                    final_unique_cats.append(candidate)
-                data["categories"] = final_unique_cats
+                qualified_shards = []
+                for s in all_shards:
+                    s_strip = s.strip()
+                    
+                    # 1. 长度门槛：必须大于 1 (干掉 C, F, A 等)
+                    # 2. 内容门槛：必须包含汉字、字母或数字 (干掉 ㏼, ★ 等)
+                    if len(s_strip) > 1 and re.search(r'[\u4e00-\u9fa5a-zA-Z0-9]', s_strip):
+                        # 3. 额外过滤：如果拆分后依然带有残留的 \ (比如 "C\" )，顺手洗掉
+                        s_strip = s_strip.replace('\\', '').strip()
+                        if s_strip and s_strip not in qualified_shards:
+                            qualified_shards.append(s_strip)
+                
+                data["categories"] = qualified_shards
 
             # 写入结果
             fout.write(json.dumps(data, ensure_ascii=False) + '\n')

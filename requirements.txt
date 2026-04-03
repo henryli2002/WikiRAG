@@ -1,0 +1,3 @@
+huggingface_hub
+opencc-python-reimplemented
+git+https://github.com/santhoshtr/wikiextractor.git
