@@ -141,3 +141,4 @@ Thumbs.db
 *.sql.gz
 *.xml
 *.jsonl
+*.parquet
