@@ -226,12 +226,12 @@ def process_and_combine(extracted_dir, category_map, output_file):
 
 
 def main():
-    xml_file = "zhwiki-latest-pages-articles.xml"
+    xml_file = "../data/raw/zhwiki-latest-pages-articles.xml"
     # 可以先用10000条测试数据验证流程，确认无误后再切换回完整数据
     # 命令为 head -n 10000 zhwiki-latest-pages-articles.xml > test.xml
-    # xml_file = "test.xml"
-    sql_file = "zhwiki-latest-categorylinks.sql.gz"
-    output_file = "zhwiki.jsonl"
+    # xml_file = "../data/raw/test.xml"
+    sql_file = "../data/raw/zhwiki-latest-categorylinks.sql.gz"
+    output_file = "../data/raw/zhwiki.jsonl"
 
     if not os.path.exists(xml_file):
         print(f"错误: 当前目录下找不到维基百科正文数据 '{xml_file}'")
