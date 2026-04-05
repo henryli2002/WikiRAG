@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  db:
+    image: ankane/pgvector:latest
+    container_name: rag_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: rag_user
+      POSTGRES_DB: rag_db
+      POSTGRES_HOST_AUTH_METHOD: trust
+    command: >
+      postgres 
+      -c shared_buffers=2GB 
+      -c work_mem=64MB
+      -c maintenance_work_mem=1GB
+      -c max_connections=200
+      -c max_wal_size=4GB
+      -c checkpoint_timeout=15min
+    shm_size: 4gb
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./data/pgdata:/var/lib/postgresql/data

@@ -1,3 +1,28 @@
 huggingface_hub
 opencc-python-reimplemented
 git+https://github.com/santhoshtr/wikiextractor.git
+
+# Embedding & Reranker
+FlagEmbedding
+
+# API
+fastapi
+uvicorn[standard]
+
+# 数据库
+psycopg2-binary
+pgvector
+
+# 分词
+jieba
+
+# 数据处理
+pandas
+pyarrow
+numpy
+tqdm
+python-dotenv
+langchain-text-splitters
+
+# 测试
+pytest

@@ -142,3 +142,7 @@ Thumbs.db
 *.xml
 *.jsonl
 *.parquet
+
+# 本地数据目录（如果有）
+data/
+models/
