@@ -74,7 +74,7 @@ def test_recall_no_duplicate_ids(cursor):
         ORDER BY embedding <=> %s::halfvec(1024)
         LIMIT 40;
         """,
-        (embedding, embedding),
+        (embedding,),
     )
     ids = [r[0] for r in cursor.fetchall()]
     assert len(ids) == len(set(ids)), "召回结果中存在重复 id"
