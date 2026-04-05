@@ -21,16 +21,17 @@ DB_PORT = os.getenv("DB_PORT", "5432")
 DB_NAME = os.getenv("POSTGRES_DB", "rag_db")
 DB_USER = os.getenv("POSTGRES_USER", "rag_user")
 
-VECTOR_RECALL_K = 40   # 向量召回数
-BM25_RECALL_K = 30     # BM25 召回数
+VECTOR_RECALL_K = 50   # 向量召回数
+BM25_RECALL_K = 10     # BM25 召回数
 HYBRID_TOP_K = 32      # 混合排序取前 N
 RERANK_TOP_K = 10      # 精排取前 N
 FINAL_TOP_K = 5        # MMR 最终返回数
 MMR_LAMBDA = 0.7       # MMR 多样性参数 (越大越相关，越小越多样)
+SCORE_THRESHOLD = 0.8  # rerank 分数阈值，<=0.8 判定为不相似
 
 VECTOR_TIMEOUT_S = 5.0   # 向量召回超时
-BM25_TIMEOUT_S = 3.0     # BM25 召回超时
-MMR_TIMEOUT_S = 3.0      # MMR 超时
+BM25_TIMEOUT_S = 5.0     # BM25 召回超时
+MMR_TIMEOUT_S = 100.0     # MMR 超时
 
 # ─── 全局模型 & 连接池 ────────────────────────────────────
 embedding_model = None
@@ -40,6 +41,9 @@ db_pool: asyncpg.Pool | None = None
 
 # 缓存 embedding 列类型
 _embedding_col_type: str | None = None
+
+# 全局搜索信号量：同一时刻只处理 1 个搜索请求，其余排队
+_search_sem: asyncio.Semaphore | None = None
 
 
 def _get_device() -> str:
@@ -84,6 +88,10 @@ async def lifespan(app: FastAPI):
     # 预热 jieba
     list(jieba.cut("预热分词"))
     print("✅ jieba 预热完成")
+
+    global _search_sem
+    _search_sem = asyncio.Semaphore(1)
+    print("✅ 搜索队列就绪 (concurrency=1)")
 
     yield
 
@@ -159,7 +167,6 @@ async def bm25_recall(query: str, k: int) -> tuple[list[dict], float]:
     t0 = time.time()
     async with db_pool.acquire() as conn:
         await conn.execute(f"SET statement_timeout = '{int(BM25_TIMEOUT_S * 1000)}ms'")
-
         # 先 AND，结果不够则 fallback 到 OR
         if len(terms) >= 2:
             tsquery_and = " & ".join(terms)
@@ -318,6 +325,11 @@ def _log_docs(label: str, docs: list[dict], top_n: int = 3):
 
 @app.post("/search", response_model=QueryResponse)
 async def search(req: QueryRequest):
+    async with _search_sem:
+        return await _do_search(req)
+
+
+async def _do_search(req: QueryRequest):
     query = req.query
     top_k = req.top_k
     loop = asyncio.get_event_loop()
@@ -330,14 +342,32 @@ async def search(req: QueryRequest):
     t_embed = (time.time() - t0) * 1000
     print(f"[1] Embedding: {t_embed:.1f}ms  vec[:10]={[round(v, 4) for v in query_vec[:10]]}")
 
-    # 2. 多路召回（asyncio.gather 真并发）
+    # 2. 多路召回（并发，任一超时/异常则取消它，用已完成的继续）
     t0 = time.time()
-    (vec_results, t_vec), (bm25_results, t_bm25) = await asyncio.gather(
-        vector_recall(query_vec, VECTOR_RECALL_K),
-        bm25_recall(query, BM25_RECALL_K),
+    vec_task = asyncio.create_task(vector_recall(query_vec, VECTOR_RECALL_K))
+    bm25_task = asyncio.create_task(bm25_recall(query, BM25_RECALL_K))
+
+    done, pending = await asyncio.wait(
+        [vec_task, bm25_task], return_when=asyncio.FIRST_EXCEPTION,
     )
+    if pending:
+        _, still_pending = await asyncio.wait(pending, timeout=0.5)
+        for t in still_pending:
+            t.cancel()
+
+    vec_results, t_vec = ([], 0.0)
+    bm25_results, t_bm25 = ([], 0.0)
+    if vec_task.done() and not vec_task.cancelled() and vec_task.exception() is None:
+        vec_results, t_vec = vec_task.result()
+    if bm25_task.done() and not bm25_task.cancelled() and bm25_task.exception() is None:
+        bm25_results, t_bm25 = bm25_task.result()
+
     t_recall = (time.time() - t0) * 1000
     print(f"[2] Parallel recall: {t_recall:.1f}ms (wall) | vector={t_vec:.1f}ms({len(vec_results)}条) | bm25={t_bm25:.1f}ms({len(bm25_results)}条)")
+    if not vec_results and vec_task.done() and vec_task.exception():
+        print(f"  ⚠ vector recall 超时/异常: {vec_task.exception()}")
+    if not bm25_results and bm25_task.done() and bm25_task.exception():
+        print(f"  ⚠ bm25 recall 超时/异常: {bm25_task.exception()}")
     _log_docs("vector", vec_results)
     _log_docs("bm25", bm25_results)
 
@@ -366,9 +396,11 @@ async def search(req: QueryRequest):
     print(f"[Total] {t_total:.1f}ms")
     print(f"{'='*60}\n")
 
-    # 格式化输出
+    # 格式化输出（过滤低分结果）
     results = []
     for doc in final:
+        if doc["score"] <= SCORE_THRESHOLD:
+            continue
         meta = doc.get("metadata", {})
         results.append(DocResult(
             id=doc["id"],
@@ -384,3 +416,8 @@ async def search(req: QueryRequest):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/")
+def root():
+    return {"service": "WikiRAG", "docs": "/docs", "health": "/health"}
