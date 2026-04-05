@@ -93,7 +93,7 @@ def main():
     print("重建 wiki_documents 表...")
     cursor.execute("DROP TABLE IF EXISTS wiki_documents;")
     cursor.execute("""
-        CREATE UNLOGGED TABLE wiki_documents (
+        CREATE TABLE wiki_documents (
             id BIGSERIAL PRIMARY KEY,
             content TEXT NOT NULL,
             metadata JSONB NOT NULL DEFAULT '{}',

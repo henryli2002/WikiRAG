@@ -171,11 +171,6 @@ def create_vector_index(cursor, conn, args):
     print(f"[完成] {index_name}  ({m}分{s}秒)")
 
 
-@timed("转为 LOGGED 表 (启用 WAL 持久化)")
-def convert_to_logged(cursor, conn):
-    cursor.execute("ALTER TABLE wiki_documents SET LOGGED;")
-    conn.commit()
-
 
 def main():
     args = parse_args()
@@ -185,7 +180,7 @@ def main():
     conn.autocommit = True
     cursor = conn.cursor()
 
-    cursor.execute("SET maintenance_work_mem = '2GB';")
+    cursor.execute("SET maintenance_work_mem = '256MB';")
 
     # 确认数据存在
     cursor.execute("SELECT COUNT(*) FROM wiki_documents;")
@@ -221,7 +216,6 @@ def main():
     create_metadata_index(cursor, conn)
     create_tsv_index(cursor, conn)
     create_vector_index(cursor, conn, args)
-    convert_to_logged(cursor, conn)
 
     cursor.close()
     conn.close()

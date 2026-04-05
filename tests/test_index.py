@@ -12,16 +12,15 @@ def test_metadata_gin_index_exists(cursor):
 
 
 def test_embedding_index_exists(cursor):
-    """向量索引是否存在（ivfflat 或 hnsw）"""
+    """向量索引是否存在（idx_emb_* 命名规则）"""
     cursor.execute("""
-        SELECT indexname, indexdef FROM pg_indexes
+        SELECT indexname FROM pg_indexes
         WHERE tablename = 'wiki_documents'
-          AND indexdef LIKE '%embedding%';
+          AND indexname LIKE 'idx_emb_%';
     """)
     rows = cursor.fetchall()
     assert len(rows) > 0, (
-        "embedding 向量索引不存在，请先建立索引。"
-        "参考 postgres/README.md 中的索引构建方案。"
+        "embedding 向量索引不存在，请运行 build_index.py 建立索引。"
     )
 
 

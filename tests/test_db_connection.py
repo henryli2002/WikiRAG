@@ -13,6 +13,17 @@ def test_pgvector_extension(cursor):
     assert row is not None, "pgvector 扩展未安装"
 
 
+def test_pgvector_version(cursor):
+    """pgvector 版本 >= 0.7.0 (halfvec/bit 量化需要)"""
+    cursor.execute("SELECT extversion FROM pg_extension WHERE extname = 'vector';")
+    version = cursor.fetchone()[0]
+    major, minor = [int(x) for x in version.split(".")[:2]]
+    assert (major, minor) >= (0, 7), (
+        f"pgvector 版本 {version} 过低，需要 >= 0.7.0 以支持 halfvec 量化。"
+        "请使用 pgvector/pgvector:pg17 镜像。"
+    )
+
+
 def test_table_exists(cursor):
     """wiki_documents 表是否存在"""
     cursor.execute("""
