@@ -149,11 +149,57 @@ python scripts/build_index.py
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
+### 服务使用指南
+
+#### 接口一览
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/search` | 检索接口 |
+| GET | `/health` | 健康检查 |
+
+#### 搜索请求
+
 ```bash
 curl -X POST http://localhost:8000/search \
   -H "Content-Type: application/json" \
   -d '{"query": "量子计算的基本原理", "top_k": 5}'
 ```
+
+**请求参数**
+
+| 字段 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| query | string | 是 | - | 检索查询文本 |
+| top_k | int | 否 | 5 | 返回结果数 (1~20) |
+
+**响应示例**
+
+```json
+{
+  "query": "量子计算的基本原理",
+  "results": [
+    {
+      "id": 2586222,
+      "pageid": "12345",
+      "title": "量子计算",
+      "content": "条目：量子计算\n内容：量子计算是一种利用量子力学现象...",
+      "score": 0.9231
+    }
+  ]
+}
+```
+
+**响应字段**
+
+| 字段 | 说明 |
+|------|------|
+| id | 数据库主键 |
+| pageid | 维基百科页面 ID |
+| title | 条目标题 |
+| content | 检索到的文本块 |
+| score | 精排分数 (0~1, 越高越相关) |
+
 
 ## 实验细节
 
@@ -330,11 +376,13 @@ RERANKER_MODEL_PATH=/app/models/bge-reranker-v2-m3
 
 | 包 | 最低版本 | 用途 |
 |---|---------|------|
-| FlagEmbedding | 1.2+ | BGE-M3 embedding + BGE-Reranker 精排 |
+| FlagEmbedding | 1.3.4+ | BGE-M3 embedding + BGE-Reranker 精排 |
+| transformers | 4.38+, <5 | HuggingFace 模型加载 (v5 与 FlagEmbedding 不兼容) |
+| torch | 2.0+ | 推理框架, MPS/CUDA 加速 |
 | fastapi | 0.110+ | API 框架 |
 | uvicorn | 0.29+ | ASGI 服务器 |
-| psycopg2-binary | 2.9+ | PostgreSQL 驱动 |
-| pgvector (Python) | 0.3+ | psycopg2 的 vector 类型注册 |
+| psycopg2-binary | 2.9+ | PostgreSQL 驱动 (数据导入) |
+| asyncpg | 0.29+ | 异步 PostgreSQL 驱动 (API 服务) |
 | jieba | 0.42+ | 中文分词 |
 | pandas | 2.0+ | Parquet 读取 |
 | pyarrow | 15.0+ | Parquet 序列化 |
