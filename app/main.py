@@ -78,54 +78,30 @@ def embed_query(query: str) -> list[float]:
     return out["dense_vecs"][0].tolist()
 
 
-def _detect_vector_index_type(cursor) -> str:
-    """检测当前向量索引使用的类型，决定查询时的 cast 方式"""
+def _get_embedding_type(cursor) -> str:
+    """检测 embedding 列的存储类型"""
     cursor.execute("""
-        SELECT indexdef FROM pg_indexes
-        WHERE tablename = 'wiki_documents' AND indexname LIKE 'idx_emb_%'
-        LIMIT 1;
+        SELECT udt_name FROM information_schema.columns
+        WHERE table_name = 'wiki_documents' AND column_name = 'embedding';
     """)
-    row = cursor.fetchone()
-    if not row:
-        return "vector"
-    indexdef = row[0]
-    if "halfvec" in indexdef:
-        return "halfvec"
-    elif "bit_hamming" in indexdef or "binary_quantize" in indexdef:
-        return "bit"
-    return "vector"
+    return cursor.fetchone()[0]  # "vector" 或 "halfvec"
 
 
 def vector_recall(cursor, query_vec: list[float], k: int) -> list[dict]:
-    """pgvector 向量召回，自动适配索引类型 (vector / halfvec / bit)"""
-    idx_type = _detect_vector_index_type(cursor)
+    """pgvector 向量召回，自动适配 embedding 列类型"""
+    col_type = _get_embedding_type(cursor)
+    cast = f"::{col_type}(1024)"
 
-    if idx_type == "halfvec":
-        sql = """
-            SELECT id, content, metadata,
-                   1 - (embedding::halfvec(1024) <=> %s::halfvec(1024)) AS score
-            FROM wiki_documents
-            ORDER BY embedding::halfvec(1024) <=> %s::halfvec(1024)
-            LIMIT %s;
-        """
-    elif idx_type == "bit":
-        sql = """
-            SELECT id, content, metadata,
-                   1 - (binary_quantize(embedding)::bit(1024) <~> binary_quantize(%s::vector)::bit(1024))::float AS score
-            FROM wiki_documents
-            ORDER BY binary_quantize(embedding)::bit(1024) <~> binary_quantize(%s::vector)::bit(1024)
-            LIMIT %s;
-        """
-    else:
-        sql = """
-            SELECT id, content, metadata,
-                   1 - (embedding <=> %s::vector) AS score
-            FROM wiki_documents
-            ORDER BY embedding <=> %s::vector
-            LIMIT %s;
-        """
-
-    cursor.execute(sql, (query_vec, query_vec, k))
+    cursor.execute(
+        f"""
+        SELECT id, content, metadata,
+               1 - (embedding <=> %s{cast}) AS score
+        FROM wiki_documents
+        ORDER BY embedding <=> %s{cast}
+        LIMIT %s;
+        """,
+        (query_vec, query_vec, k),
+    )
     rows = cursor.fetchall()
     return [
         {"id": r[0], "content": r[1], "metadata": r[2], "score": float(r[3])}

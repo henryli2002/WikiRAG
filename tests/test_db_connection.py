@@ -71,7 +71,7 @@ def test_embedding_not_null(cursor):
 
 def test_embedding_dimension(cursor):
     """向量维度是否为 1024"""
-    cursor.execute("SELECT vector_dims(embedding) FROM wiki_documents LIMIT 1;")
+    cursor.execute("SELECT array_length(embedding::real[], 1) FROM wiki_documents LIMIT 1;")
     dim = cursor.fetchone()[0]
     assert dim == 1024, f"向量维度应为 1024，实际为 {dim}"
 

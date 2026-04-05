@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS wiki_documents (
     id BIGSERIAL PRIMARY KEY,
     content TEXT NOT NULL,
     metadata JSONB NOT NULL DEFAULT '{}',
-    embedding VECTOR(1024),
+    embedding HALFVEC(1024),
     tsv TSVECTOR
 );
 

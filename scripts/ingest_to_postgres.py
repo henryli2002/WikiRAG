@@ -97,7 +97,7 @@ def main():
             id BIGSERIAL PRIMARY KEY,
             content TEXT NOT NULL,
             metadata JSONB NOT NULL DEFAULT '{}',
-            embedding VECTOR(1024),
+            embedding HALFVEC(1024),
             title_seg TEXT NOT NULL DEFAULT '',
             content_seg TEXT NOT NULL DEFAULT '',
             tsv TSVECTOR

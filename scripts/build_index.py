@@ -58,12 +58,12 @@ def parse_args():
     # HNSW 参数
     p.add_argument("--m", type=int, default=16,
                    help="HNSW 每层连接数 (默认: 16，越大越精准但越占内存)")
-    p.add_argument("--ef-construction", type=int, default=64,
-                   help="HNSW 构建时搜索宽度 (默认: 64，越大构建越慢但质量越高)")
+    p.add_argument("--ef-construction", type=int, default=32,
+                   help="HNSW 构建时搜索宽度 (默认: 32，必须 >= 2*m，越大构建越慢但质量越高)")
 
     # 量化
-    p.add_argument("--quantize", choices=["none", "halfvec", "bit"], default="halfvec",
-                   help="量化方式: none=原始FP32, halfvec=FP16半精度, bit=二值量化, 注意本身就是FP16嵌入")
+    p.add_argument("--quantize", choices=["fp32", "fp16", "bit"], default="fp16",
+                   help="索引精度: fp32=原始存储精度, fp16=半精度(默认,与嵌入原始精度一致), bit=二值量化")
 
     # 降维
     p.add_argument("--dim", type=int, default=ORIGINAL_DIM,
@@ -113,7 +113,12 @@ def create_vector_index(cursor, conn, args):
     quantize = args.quantize
     dim = args.dim
 
-    # 索引名编码配置：idx_emb_hnsw_halfvec_512_m16_ef64 / idx_emb_ivfflat_none_1024_l1000
+    # 参数校验
+    if method == "hnsw" and args.ef_construction < 2 * args.m:
+        print(f"❌ ef_construction ({args.ef_construction}) 必须 >= 2 * m ({2 * args.m})")
+        raise SystemExit(1)
+
+    # 索引名编码配置
     if method == "hnsw":
         index_name = f"idx_emb_{method}_{quantize}_{dim}_m{args.m}_ef{args.ef_construction}"
     else:
@@ -125,21 +130,22 @@ def create_vector_index(cursor, conn, args):
         print(f"\n[跳过] 索引 {index_name} 已存在")
         return
 
-    # 构建表达式和 ops
-    if quantize == "halfvec":
-        expression = f"(embedding::halfvec({dim}))"
+    # 构建表达式和 ops（存储已经是 halfvec）
+    if quantize == "fp16":
+        if dim != ORIGINAL_DIM:
+            expression = f"(embedding::halfvec({dim}))"
+        else:
+            expression = "embedding"
         ops = "halfvec_cosine_ops"
+    elif quantize == "fp32":
+        expression = f"(embedding::vector({dim}))"
+        ops = "vector_cosine_ops"
     elif quantize == "bit":
-        expression = f"(binary_quantize(embedding)::bit({dim}))"
+        expression = f"(binary_quantize(embedding::vector({dim}))::bit({dim}))"
         ops = "bit_hamming_ops"
-    elif dim != ORIGINAL_DIM:
-        # 降维但不量化：用 halfvec 做降维容器（pgvector 不支持原生 PCA，
-        # 这里截取前 N 维作为简易降维，实际生产中应用 PCA 矩阵）
-        expression = f"(embedding::halfvec({dim}))"
-        ops = "halfvec_cosine_ops"
     else:
         expression = "embedding"
-        ops = "vector_cosine_ops"
+        ops = "halfvec_cosine_ops"
 
     # 构建索引参数
     if method == "hnsw":
@@ -149,7 +155,7 @@ def create_vector_index(cursor, conn, args):
         with_clause = f"WITH (lists = {args.lists})"
         desc = f"IVFFlat (lists={args.lists})"
 
-    if quantize != "none":
+    if quantize != "fp32":
         desc += f", quantize={quantize}"
     if dim != ORIGINAL_DIM:
         desc += f", dim={dim}"
