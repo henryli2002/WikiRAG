@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import numpy as np
 import psycopg2
 import psycopg2.extras
@@ -37,13 +38,25 @@ def get_db():
     return conn
 
 
+def _get_device() -> str:
+    """优先 MPS (Apple Silicon)，其次 CUDA，最后 CPU"""
+    import torch
+    if torch.backends.mps.is_available():
+        return "mps"
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global embedding_model, reranker_model
+    device = _get_device()
+    print(f"推理设备: {device}")
     print("加载 embedding 模型...")
-    embedding_model = BGEM3FlagModel(EMBEDDING_MODEL_PATH, use_fp16=True)
+    embedding_model = BGEM3FlagModel(EMBEDDING_MODEL_PATH, use_fp16=True, devices=[device])
     print("加载 reranker 模型...")
-    reranker_model = FlagReranker(RERANKER_MODEL_PATH, use_fp16=True)
+    reranker_model = FlagReranker(RERANKER_MODEL_PATH, use_fp16=True, devices=[device])
     print("✅ 模型加载完成")
     yield
 
@@ -114,26 +127,37 @@ def bm25_recall(cursor, query: str, k: int) -> list[dict]:
     BM25 召回：jieba 分词 → simple 字典 tsquery → GIN 索引检索 + ts_rank 排序。
     完全走 PostgreSQL 原生全文检索，无需 Python 端计算。
     """
-    # jieba 分词，过滤标点，用 | 连接做 OR 召回
+    # jieba 分词，过滤标点和单字词
     tokens = jieba.cut(query)
     terms = [re.sub(r"[&|!():'\\]", "", t).strip() for t in tokens]
-    terms = [t for t in terms if t and not re.match(r'^[\s\W]+$', t)]
+    terms = [t for t in terms if len(t) >= 2 and not re.match(r'^[\s\W]+$', t)]
     if not terms:
         return []
-    tsquery_str = " | ".join(terms)
 
-    cursor.execute(
-        """
-        SELECT id, content, metadata,
-               ts_rank(tsv, to_tsquery('simple', %s)) AS score
-        FROM wiki_documents
-        WHERE tsv @@ to_tsquery('simple', %s)
-        ORDER BY score DESC
-        LIMIT %s;
-        """,
-        (tsquery_str, tsquery_str, k),
-    )
-    rows = cursor.fetchall()
+    def _do_query(tsquery_str):
+        cursor.execute(
+            """
+            SELECT id, content, metadata,
+                   ts_rank(tsv, to_tsquery('simple', %s)) AS score
+            FROM wiki_documents
+            WHERE tsv @@ to_tsquery('simple', %s)
+            ORDER BY score DESC
+            LIMIT %s;
+            """,
+            (tsquery_str, tsquery_str, k),
+        )
+        return cursor.fetchall()
+
+    # 策略：先 AND，结果不够则 fallback 到 OR
+    if len(terms) >= 2:
+        rows = _do_query(" & ".join(terms))
+        if len(rows) >= k:
+            return [
+                {"id": r[0], "content": r[1], "metadata": r[2], "score": float(r[3])}
+                for r in rows
+            ]
+
+    rows = _do_query(" | ".join(terms))
     return [
         {"id": r[0], "content": r[1], "metadata": r[2], "score": float(r[3])}
         for r in rows
@@ -191,9 +215,13 @@ def mmr_select(query_vec: list[float], docs: list[dict], k: int, lam: float) -> 
     conn = get_db()
     cursor = conn.cursor()
     for doc in docs:
-        cursor.execute("SELECT embedding FROM wiki_documents WHERE id = %s;", (doc["id"],))
+        cursor.execute("SELECT embedding::text FROM wiki_documents WHERE id = %s;", (doc["id"],))
         row = cursor.fetchone()
-        doc_vecs.append(np.array(row[0], dtype=np.float32) if row else np.zeros(1024))
+        if row and row[0]:
+            vec = np.array([float(x) for x in row[0].strip("[]").split(",")], dtype=np.float32)
+        else:
+            vec = np.zeros(1024, dtype=np.float32)
+        doc_vecs.append(vec)
     cursor.close()
     conn.close()
 
@@ -228,34 +256,79 @@ def mmr_select(query_vec: list[float], docs: list[dict], k: int, lam: float) -> 
     return [docs[i] for i in selected]
 
 
+# ─── 调试辅助 ──────────────────────────────────────────────
+
+def _trunc(text: str, max_len: int = 10) -> str:
+    return text[:max_len] + "..." if len(text) > max_len else text
+
+
+def _log_docs(label: str, docs: list[dict], top_n: int = 3):
+    print(f"  [{label}] 共 {len(docs)} 条, top {min(top_n, len(docs))}:")
+    for doc in docs[:top_n]:
+        meta = doc.get("metadata", {})
+        title = _trunc(str(meta.get("title", "")))
+        content = _trunc(doc.get("content", ""))
+        print(f"    id={doc['id']} score={doc['score']:.4f} title={title} content={content}")
+
+
 # ─── API 路由 ────────────────────────────────────────────
 
 @app.post("/search", response_model=QueryResponse)
 def search(req: QueryRequest):
     query = req.query
     top_k = req.top_k
+    print(f"\n{'='*60}")
+    print(f"Query: {query}")
 
     # 1. Query Embedding
+    t0 = time.time()
     query_vec = embed_query(query)
+    t_embed = (time.time() - t0) * 1000
+    print(f"[1] Embedding: {t_embed:.1f}ms  vec[:10]={[round(v, 4) for v in query_vec[:10]]}")
 
     conn = get_db()
     cursor = conn.cursor()
 
     # 2. 多路召回
+    t0 = time.time()
     vec_results = vector_recall(cursor, query_vec, VECTOR_RECALL_K)
+    t_vec = (time.time() - t0) * 1000
+    print(f"[2a] Vector recall: {t_vec:.1f}ms")
+    _log_docs("vector", vec_results)
+
+    t0 = time.time()
     bm25_results = bm25_recall(cursor, query, BM25_RECALL_K)
+    t_bm25 = (time.time() - t0) * 1000
+    print(f"[2b] BM25 recall: {t_bm25:.1f}ms")
+    _log_docs("bm25", bm25_results)
 
     cursor.close()
     conn.close()
 
     # 3. 并集 + RRF 混合排分 → top 50
+    t0 = time.time()
     merged = hybrid_merge(vec_results, bm25_results, HYBRID_TOP_K)
+    t_merge = (time.time() - t0) * 1000
+    print(f"[3] Hybrid merge: {t_merge:.1f}ms")
+    _log_docs("merged", merged)
 
     # 4. Cross-encoder 精排 → top 15
+    t0 = time.time()
     reranked = rerank(query, merged)
+    t_rerank = (time.time() - t0) * 1000
+    print(f"[4] Rerank: {t_rerank:.1f}ms")
+    _log_docs("reranked", reranked)
 
     # 5. MMR 去重 → top K
+    t0 = time.time()
     final = mmr_select(query_vec, reranked, top_k, MMR_LAMBDA)
+    t_mmr = (time.time() - t0) * 1000
+    print(f"[5] MMR: {t_mmr:.1f}ms")
+    _log_docs("final", final)
+
+    t_total = t_embed + t_vec + t_bm25 + t_merge + t_rerank + t_mmr
+    print(f"[Total] {t_total:.1f}ms")
+    print(f"{'='*60}\n")
 
     # 格式化输出
     results = []
