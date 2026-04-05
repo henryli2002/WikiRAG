@@ -7,7 +7,7 @@
 <div align="center">
 
 ```
-                    Query
+                    Query ----> LLM重写、原子分割
                       │
                       ▼
           Embedding (BGE-M3, 1024 维)

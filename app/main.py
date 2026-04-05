@@ -1,9 +1,10 @@
 import os
 import re
 import time
+import asyncio
 import numpy as np
-import psycopg2
-import psycopg2.extras
+import asyncpg
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
@@ -22,27 +23,29 @@ DB_USER = os.getenv("POSTGRES_USER", "rag_user")
 
 VECTOR_RECALL_K = 40   # 向量召回数
 BM25_RECALL_K = 30     # BM25 召回数
-HYBRID_TOP_K = 50      # 混合排序取前 N
-RERANK_TOP_K = 15      # 精排取前 N
+HYBRID_TOP_K = 32      # 混合排序取前 N
+RERANK_TOP_K = 10      # 精排取前 N
 FINAL_TOP_K = 5        # MMR 最终返回数
 MMR_LAMBDA = 0.7       # MMR 多样性参数 (越大越相关，越小越多样)
 
+VECTOR_TIMEOUT_S = 5.0   # 向量召回超时
+BM25_TIMEOUT_S = 3.0     # BM25 召回超时
+MMR_TIMEOUT_S = 3.0      # MMR 超时
 
-# ─── 全局模型 & 数据库连接 ───────────────────────────────
+# ─── 全局模型 & 连接池 ────────────────────────────────────
 embedding_model = None
 reranker_model = None
+thread_pool = ThreadPoolExecutor(max_workers=8)
+db_pool: asyncpg.Pool | None = None
 
-
-def get_db():
-    conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, dbname=DB_NAME, user=DB_USER)
-    return conn
+# 缓存 embedding 列类型
+_embedding_col_type: str | None = None
 
 
 def _get_device() -> str:
-    """优先 MPS (Apple Silicon)，其次 CUDA，最后 CPU"""
     import torch
     if torch.backends.mps.is_available():
-        return "mps"
+        return "mps:0"
     if torch.cuda.is_available():
         return "cuda"
     return "cpu"
@@ -50,15 +53,42 @@ def _get_device() -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global embedding_model, reranker_model
+    global embedding_model, reranker_model, db_pool, _embedding_col_type
     device = _get_device()
     print(f"推理设备: {device}")
     print("加载 embedding 模型...")
-    embedding_model = BGEM3FlagModel(EMBEDDING_MODEL_PATH, use_fp16=True, devices=[device])
+    embedding_model = BGEM3FlagModel(EMBEDDING_MODEL_PATH, use_fp16=True)
+    embedding_model.model.to(device)
+    print(f"  embedding device: {next(embedding_model.model.parameters()).device}")
     print("加载 reranker 模型...")
-    reranker_model = FlagReranker(RERANKER_MODEL_PATH, use_fp16=True, devices=[device])
-    print("✅ 模型加载完成")
+    reranker_model = FlagReranker(RERANKER_MODEL_PATH, use_fp16=True, batch_size=32)
+    reranker_model.model.to(device)
+    print(f"  reranker device: {next(reranker_model.model.parameters()).device}")
+    print("✅ 模型加载完成（常驻内存, FP16 推理）")
+
+    # 异步连接池
+    db_pool = await asyncpg.create_pool(
+        host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER,
+        min_size=4, max_size=16,
+    )
+    print("✅ asyncpg 连接池就绪")
+
+    # 预缓存 embedding 列类型
+    row = await db_pool.fetchrow("""
+        SELECT udt_name FROM information_schema.columns
+        WHERE table_name = 'wiki_documents' AND column_name = 'embedding';
+    """)
+    _embedding_col_type = row["udt_name"]
+    print(f"Embedding 列类型: {_embedding_col_type}")
+
+    # 预热 jieba
+    list(jieba.cut("预热分词"))
+    print("✅ jieba 预热完成")
+
     yield
+
+    await db_pool.close()
+    thread_pool.shutdown(wait=False)
 
 
 app = FastAPI(title="WikiRAG", lifespan=lifespan)
@@ -86,89 +116,99 @@ class QueryResponse(BaseModel):
 # ─── 核心函数 ────────────────────────────────────────────
 
 def embed_query(query: str) -> list[float]:
-    """对 query 进行向量化 (use_fp16=True, 输出即 FP16)"""
     out = embedding_model.encode([query], max_length=512)
     return out["dense_vecs"][0].tolist()
 
 
-def _get_embedding_type(cursor) -> str:
-    """检测 embedding 列的存储类型"""
-    cursor.execute("""
-        SELECT udt_name FROM information_schema.columns
-        WHERE table_name = 'wiki_documents' AND column_name = 'embedding';
-    """)
-    return cursor.fetchone()[0]  # "vector" 或 "halfvec"
-
-
-def vector_recall(cursor, query_vec: list[float], k: int) -> list[dict]:
-    """pgvector 向量召回，自动适配 embedding 列类型"""
-    col_type = _get_embedding_type(cursor)
-    cast = f"::{col_type}(1024)"
-
-    cursor.execute(
-        f"""
-        SELECT id, content, metadata,
-               1 - (embedding <=> %s{cast}) AS score
-        FROM wiki_documents
-        ORDER BY embedding <=> %s{cast}
-        LIMIT %s;
-        """,
-        (query_vec, query_vec, k),
-    )
-    rows = cursor.fetchall()
-    return [
-        {"id": r[0], "content": r[1], "metadata": r[2], "score": float(r[3])}
+async def vector_recall(query_vec: list[float], k: int) -> tuple[list[dict], float]:
+    """pgvector 向量召回（asyncpg 原生异步）"""
+    cast = f"::{_embedding_col_type}(1024)"
+    vec_str = "[" + ",".join(str(v) for v in query_vec) + "]"
+    t0 = time.time()
+    async with db_pool.acquire() as conn:
+        await conn.execute(f"SET statement_timeout = '{int(VECTOR_TIMEOUT_S * 1000)}ms'")
+        rows = await conn.fetch(
+            f"""
+            SELECT id, content, metadata,
+                   1 - (embedding <=> $1{cast}) AS score
+            FROM wiki_documents
+            ORDER BY embedding <=> $1{cast}
+            LIMIT $2;
+            """,
+            vec_str, k,
+        )
+    elapsed = (time.time() - t0) * 1000
+    import json
+    results = [
+        {"id": r["id"], "content": r["content"],
+         "metadata": json.loads(r["metadata"]) if isinstance(r["metadata"], str) else r["metadata"],
+         "score": float(r["score"])}
         for r in rows
     ]
+    return results, elapsed
 
 
-def bm25_recall(cursor, query: str, k: int) -> list[dict]:
-    """
-    BM25 召回：jieba 分词 → simple 字典 tsquery → GIN 索引检索 + ts_rank 排序。
-    完全走 PostgreSQL 原生全文检索，无需 Python 端计算。
-    """
-    # jieba 分词，过滤标点和单字词
+async def bm25_recall(query: str, k: int) -> tuple[list[dict], float]:
+    """BM25 召回（asyncpg 原生异步）"""
     tokens = jieba.cut(query)
     terms = [re.sub(r"[&|!():'\\]", "", t).strip() for t in tokens]
     terms = [t for t in terms if len(t) >= 2 and not re.match(r'^[\s\W]+$', t)]
     if not terms:
-        return []
+        return [], 0.0
 
-    def _do_query(tsquery_str):
-        cursor.execute(
+    t0 = time.time()
+    async with db_pool.acquire() as conn:
+        await conn.execute(f"SET statement_timeout = '{int(BM25_TIMEOUT_S * 1000)}ms'")
+
+        # 先 AND，结果不够则 fallback 到 OR
+        if len(terms) >= 2:
+            tsquery_and = " & ".join(terms)
+            rows = await conn.fetch(
+                """
+                SELECT id, content, metadata,
+                       ts_rank(tsv, to_tsquery('simple', $1)) AS score
+                FROM wiki_documents
+                WHERE tsv @@ to_tsquery('simple', $1)
+                ORDER BY score DESC
+                LIMIT $2;
+                """,
+                tsquery_and, k,
+            )
+            if len(rows) >= k:
+                elapsed = (time.time() - t0) * 1000
+                import json
+                return [
+                    {"id": r["id"], "content": r["content"],
+                     "metadata": json.loads(r["metadata"]) if isinstance(r["metadata"], str) else r["metadata"],
+                     "score": float(r["score"])}
+                    for r in rows
+                ], elapsed
+
+        tsquery_or = " | ".join(terms)
+        rows = await conn.fetch(
             """
             SELECT id, content, metadata,
-                   ts_rank(tsv, to_tsquery('simple', %s)) AS score
+                   ts_rank(tsv, to_tsquery('simple', $1)) AS score
             FROM wiki_documents
-            WHERE tsv @@ to_tsquery('simple', %s)
+            WHERE tsv @@ to_tsquery('simple', $1)
             ORDER BY score DESC
-            LIMIT %s;
+            LIMIT $2;
             """,
-            (tsquery_str, tsquery_str, k),
+            tsquery_or, k,
         )
-        return cursor.fetchall()
 
-    # 策略：先 AND，结果不够则 fallback 到 OR
-    if len(terms) >= 2:
-        rows = _do_query(" & ".join(terms))
-        if len(rows) >= k:
-            return [
-                {"id": r[0], "content": r[1], "metadata": r[2], "score": float(r[3])}
-                for r in rows
-            ]
-
-    rows = _do_query(" | ".join(terms))
+    elapsed = (time.time() - t0) * 1000
+    import json
     return [
-        {"id": r[0], "content": r[1], "metadata": r[2], "score": float(r[3])}
+        {"id": r["id"], "content": r["content"],
+         "metadata": json.loads(r["metadata"]) if isinstance(r["metadata"], str) else r["metadata"],
+         "score": float(r["score"])}
         for r in rows
-    ]
+    ], elapsed
 
 
 def hybrid_merge(vector_results: list[dict], bm25_results: list[dict], k: int) -> list[dict]:
-    """
-    并集 + RRF (Reciprocal Rank Fusion) 混合排分。
-    RRF 公式：score = sum(1 / (rank + 60))
-    """
+    """并集 + RRF (Reciprocal Rank Fusion) 混合排分"""
     rrf_scores: dict[int, float] = {}
     doc_map: dict[int, dict] = {}
 
@@ -190,10 +230,13 @@ def hybrid_merge(vector_results: list[dict], bm25_results: list[dict], k: int) -
 
 
 def rerank(query: str, docs: list[dict]) -> list[dict]:
-    """使用 cross-encoder 精排"""
+    """cross-encoder 精排（模型常驻内存，batch FP16 并行推理）"""
     if not docs:
         return []
     pairs = [[query, doc["content"]] for doc in docs]
+    print(f"  [rerank] {len(pairs)} pairs, batch_size={reranker_model.batch_size}, "
+          f"device={next(reranker_model.model.parameters()).device}, "
+          f"fp16={reranker_model.use_fp16}")
     scores = reranker_model.compute_score(pairs, normalize=True)
     if isinstance(scores, float):
         scores = [scores]
@@ -202,31 +245,31 @@ def rerank(query: str, docs: list[dict]) -> list[dict]:
     return sorted(docs, key=lambda x: x["score"], reverse=True)[:RERANK_TOP_K]
 
 
-def mmr_select(query_vec: list[float], docs: list[dict], k: int, lam: float) -> list[dict]:
-    """
-    Maximal Marginal Relevance：平衡相关性与多样性。
-    score = λ * relevance - (1-λ) * max_similarity_to_selected
-    """
+async def mmr_select(query_vec: list[float], docs: list[dict], k: int, lam: float) -> list[dict]:
+    """Maximal Marginal Relevance：平衡相关性与多样性"""
     if len(docs) <= k:
         return docs
 
-    # 为每个 doc 拿 embedding
+    # 批量拉取 embedding（异步）
+    doc_ids = [doc["id"] for doc in docs]
+    async with db_pool.acquire() as conn:
+        await conn.execute(f"SET statement_timeout = '{int(MMR_TIMEOUT_S * 1000)}ms'")
+        rows = await conn.fetch(
+            "SELECT id, embedding::text FROM wiki_documents WHERE id = ANY($1);",
+            doc_ids,
+        )
+    emb_map = {r["id"]: r["embedding"] for r in rows}
+
     doc_vecs = []
-    conn = get_db()
-    cursor = conn.cursor()
     for doc in docs:
-        cursor.execute("SELECT embedding::text FROM wiki_documents WHERE id = %s;", (doc["id"],))
-        row = cursor.fetchone()
-        if row and row[0]:
-            vec = np.array([float(x) for x in row[0].strip("[]").split(",")], dtype=np.float32)
+        raw = emb_map.get(doc["id"])
+        if raw:
+            vec = np.array([float(x) for x in raw.strip("[]").split(",")], dtype=np.float32)
         else:
             vec = np.zeros(1024, dtype=np.float32)
         doc_vecs.append(vec)
-    cursor.close()
-    conn.close()
 
     query_np = np.array(query_vec, dtype=np.float32)
-    # 归一化
     query_norm = query_np / (np.linalg.norm(query_np) + 1e-9)
     doc_norms = [v / (np.linalg.norm(v) + 1e-9) for v in doc_vecs]
 
@@ -238,7 +281,7 @@ def mmr_select(query_vec: list[float], docs: list[dict], k: int, lam: float) -> 
         best_score = -float("inf")
 
         for i in candidates:
-            relevance = docs[i]["score"]  # reranker 分数
+            relevance = docs[i]["score"]
             if selected:
                 max_sim = max(float(np.dot(doc_norms[i], doc_norms[j])) for j in selected)
             else:
@@ -274,36 +317,29 @@ def _log_docs(label: str, docs: list[dict], top_n: int = 3):
 # ─── API 路由 ────────────────────────────────────────────
 
 @app.post("/search", response_model=QueryResponse)
-def search(req: QueryRequest):
+async def search(req: QueryRequest):
     query = req.query
     top_k = req.top_k
+    loop = asyncio.get_event_loop()
     print(f"\n{'='*60}")
     print(f"Query: {query}")
 
-    # 1. Query Embedding
+    # 1. Query Embedding（线程池，避免阻塞事件循环）
     t0 = time.time()
-    query_vec = embed_query(query)
+    query_vec = await loop.run_in_executor(thread_pool, embed_query, query)
     t_embed = (time.time() - t0) * 1000
     print(f"[1] Embedding: {t_embed:.1f}ms  vec[:10]={[round(v, 4) for v in query_vec[:10]]}")
 
-    conn = get_db()
-    cursor = conn.cursor()
-
-    # 2. 多路召回
+    # 2. 多路召回（asyncio.gather 真并发）
     t0 = time.time()
-    vec_results = vector_recall(cursor, query_vec, VECTOR_RECALL_K)
-    t_vec = (time.time() - t0) * 1000
-    print(f"[2a] Vector recall: {t_vec:.1f}ms")
+    (vec_results, t_vec), (bm25_results, t_bm25) = await asyncio.gather(
+        vector_recall(query_vec, VECTOR_RECALL_K),
+        bm25_recall(query, BM25_RECALL_K),
+    )
+    t_recall = (time.time() - t0) * 1000
+    print(f"[2] Parallel recall: {t_recall:.1f}ms (wall) | vector={t_vec:.1f}ms({len(vec_results)}条) | bm25={t_bm25:.1f}ms({len(bm25_results)}条)")
     _log_docs("vector", vec_results)
-
-    t0 = time.time()
-    bm25_results = bm25_recall(cursor, query, BM25_RECALL_K)
-    t_bm25 = (time.time() - t0) * 1000
-    print(f"[2b] BM25 recall: {t_bm25:.1f}ms")
     _log_docs("bm25", bm25_results)
-
-    cursor.close()
-    conn.close()
 
     # 3. 并集 + RRF 混合排分 → top 50
     t0 = time.time()
@@ -312,21 +348,21 @@ def search(req: QueryRequest):
     print(f"[3] Hybrid merge: {t_merge:.1f}ms")
     _log_docs("merged", merged)
 
-    # 4. Cross-encoder 精排 → top 15
+    # 4. Cross-encoder 精排 → top 15（线程池，GPU 密集）
     t0 = time.time()
-    reranked = rerank(query, merged)
+    reranked = await loop.run_in_executor(thread_pool, rerank, query, merged)
     t_rerank = (time.time() - t0) * 1000
     print(f"[4] Rerank: {t_rerank:.1f}ms")
     _log_docs("reranked", reranked)
 
     # 5. MMR 去重 → top K
     t0 = time.time()
-    final = mmr_select(query_vec, reranked, top_k, MMR_LAMBDA)
+    final = await mmr_select(query_vec, reranked, top_k, MMR_LAMBDA)
     t_mmr = (time.time() - t0) * 1000
     print(f"[5] MMR: {t_mmr:.1f}ms")
     _log_docs("final", final)
 
-    t_total = t_embed + t_vec + t_bm25 + t_merge + t_rerank + t_mmr
+    t_total = t_embed + t_recall + t_merge + t_rerank + t_mmr
     print(f"[Total] {t_total:.1f}ms")
     print(f"{'='*60}\n")
 
