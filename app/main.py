@@ -90,8 +90,8 @@ async def lifespan(app: FastAPI):
     print("✅ jieba 预热完成")
 
     global _search_sem
-    _search_sem = asyncio.Semaphore(1)
-    print("✅ 搜索队列就绪 (concurrency=1)")
+    _search_sem = asyncio.Semaphore(4)
+    print("✅ 搜索队列就绪 (concurrency=4)")
 
     yield
 
@@ -156,18 +156,55 @@ async def vector_recall(query_vec: list[float], k: int) -> tuple[list[dict], flo
     return results, elapsed
 
 
+# 中文高频泛词停用词表，这类词选择性极低，放入 OR query 会命中大量无关行
+_BM25_STOPWORDS = {
+    "基本", "原理", "介绍", "方法", "作用", "什么", "怎么", "如何",
+    "哪些", "一般", "通常", "主要", "相关", "以及", "所以", "因此",
+    "但是", "然而", "还是", "还有", "这个", "那个", "这些", "那些",
+    "可以", "需要", "进行", "使用", "通过", "对于", "关于", "由于",
+    "根据", "包括", "其中", "之间", "之后", "之前", "以上", "以下",
+    "就是", "一种", "一个", "我们", "他们", "它们", "这种", "那种",
+    "方面", "问题", "情况", "过程", "系统", "技术", "应用", "研究",
+    "分析", "实现", "结果", "影响", "发展", "目前", "已经", "非常",
+}
+
+# OR 回退最多保留的词数；过多词会让命中行数爆炸
+_BM25_OR_MAX_TERMS = 4
+
+# OR 回退时，子查询候选上限；GIN 扫出来的行只取这么多再打分排序
+# 避免对全表命中行做 ts_rank + sort（O(n) 瓶颈）
+_BM25_OR_CANDIDATE_CAP = 500
+
+
+def _build_bm25_terms(query: str) -> list[str]:
+    """分词 → 清理特殊字符 → 去重 → 去停用词 → 返回去重后词列表"""
+    raw = jieba.cut(query)
+    seen: set[str] = set()
+    terms: list[str] = []
+    for t in raw:
+        t = re.sub(r"[&|!():'\\]", "", t).strip()
+        if len(t) < 2 or re.match(r'^[\s\W]+$', t):
+            continue
+        if t in seen or t in _BM25_STOPWORDS:
+            continue
+        seen.add(t)
+        terms.append(t)
+    return terms
+
+
 async def bm25_recall(query: str, k: int) -> tuple[list[dict], float]:
     """BM25 召回（asyncpg 原生异步）"""
-    tokens = jieba.cut(query)
-    terms = [re.sub(r"[&|!():'\\]", "", t).strip() for t in tokens]
-    terms = [t for t in terms if len(t) >= 2 and not re.match(r'^[\s\W]+$', t)]
+    import json
+
+    terms = _build_bm25_terms(query)
     if not terms:
         return [], 0.0
 
     t0 = time.time()
     async with db_pool.acquire() as conn:
         await conn.execute(f"SET statement_timeout = '{int(BM25_TIMEOUT_S * 1000)}ms'")
-        # 先 AND，结果不够则 fallback 到 OR
+
+        # 先 AND，结果足够直接返回
         if len(terms) >= 2:
             tsquery_and = " & ".join(terms)
             rows = await conn.fetch(
@@ -183,7 +220,6 @@ async def bm25_recall(query: str, k: int) -> tuple[list[dict], float]:
             )
             if len(rows) >= k:
                 elapsed = (time.time() - t0) * 1000
-                import json
                 return [
                     {"id": r["id"], "content": r["content"],
                      "metadata": json.loads(r["metadata"]) if isinstance(r["metadata"], str) else r["metadata"],
@@ -191,21 +227,29 @@ async def bm25_recall(query: str, k: int) -> tuple[list[dict], float]:
                     for r in rows
                 ], elapsed
 
-        tsquery_or = " | ".join(terms)
+        # OR 回退：按词长降序取最多 _BM25_OR_MAX_TERMS 个词（越长选择性越高）
+        or_terms = sorted(terms, key=len, reverse=True)[:_BM25_OR_MAX_TERMS]
+        tsquery_or = " | ".join(or_terms)
+        print(f"  [bm25] AND 不足，OR fallback terms={or_terms}")
+        # 用子查询先 LIMIT 候选数，再在小集合上做 ts_rank + sort
+        # 避免对全表命中行做 O(n) 排序
         rows = await conn.fetch(
             """
             SELECT id, content, metadata,
                    ts_rank(tsv, to_tsquery('simple', $1)) AS score
-            FROM wiki_documents
-            WHERE tsv @@ to_tsquery('simple', $1)
+            FROM (
+                SELECT id, content, metadata, tsv
+                FROM wiki_documents
+                WHERE tsv @@ to_tsquery('simple', $1)
+                LIMIT $3
+            ) candidates
             ORDER BY score DESC
             LIMIT $2;
             """,
-            tsquery_or, k,
+            tsquery_or, k, _BM25_OR_CANDIDATE_CAP,
         )
 
     elapsed = (time.time() - t0) * 1000
-    import json
     return [
         {"id": r["id"], "content": r["content"],
          "metadata": json.loads(r["metadata"]) if isinstance(r["metadata"], str) else r["metadata"],

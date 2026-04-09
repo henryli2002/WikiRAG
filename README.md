@@ -226,7 +226,7 @@ curl -X POST http://localhost:8000/search \
 | 清理临时分词列 | < 1 秒 |
 | metadata GIN 索引 | 1 分 10 秒 |
 | tsv GIN 索引 | 4 分 0 秒 |
-| HNSW 向量索引 (fp16, m=16, ef=64) | 待补充 |
+| HNSW 向量索引 (fp16, m=16, ef=32) | 待补充 |
 
 ### 2. 数据库表结构
 

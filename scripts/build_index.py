@@ -223,6 +223,11 @@ def main():
     create_tsv_index(cursor, conn)
     create_vector_index(cursor, conn, args)
 
+    print("\n[开始] ANALYZE wiki_documents（更新 planner 统计信息）...")
+    t0 = time.time()
+    cursor.execute("ANALYZE wiki_documents;")
+    print(f"[完成] ANALYZE  ({time.time() - t0:.1f}秒)")
+
     cursor.close()
     conn.close()
     print("\n✅ 全部索引构建完成！")
