@@ -1,0 +1,191 @@
+=================================================================
+  WikiRAG 压力测试
+  目标: http://localhost:8000
+  并发梯度: [1, 2, 4, 8]
+  每梯度请求数: 40
+=================================================================
+
+预热（1 次请求）... OK (10430ms)
+
+并发=1, 共 40 请求...
+
+    ✓ [AND_OK  ]   9241ms  hits=5  量子纠缠实验验证贝尔不等式
+    ✓ [AND_OK  ]   6671ms  hits=5  北宋王安石变法历史背景
+    ✓ [AND_OK  ]   9725ms  hits=0  深度学习卷积神经网络图像分类
+    ✓ [AND_OK  ]   3663ms  hits=5  人类基因组计划测序技术发展
+    ✓ [AND_OK  ]   5881ms  hits=5  经济学博弈论纳什均衡应用
+    ✓ [OR_FALL ]   8903ms  hits=5  量子计算基本原理介绍
+    ✓ [OR_FALL ]   3818ms  hits=5  机器学习方法分析
+    ✓ [OR_FALL ]   8528ms  hits=5  历史发展研究
+    ✓ [SHORT   ]   4245ms  hits=5  相对论
+    ✓ [SHORT   ]   3908ms  hits=5  光合作用
+    ✓ [LONG    ]   7594ms  hits=5  请详细介绍量子力学中薛定谔方程的推导过程以及它在氢原子能级计
+    ✓ [LONG    ]   4803ms  hits=5  中国古代四大发明造纸术印刷术火药指南针对世界文明的深远影响和
+    ✓ [AND_OK  ]   4535ms  hits=5  量子纠缠实验验证贝尔不等式
+    ✓ [AND_OK  ]   4814ms  hits=5  北宋王安石变法历史背景
+    ✓ [AND_OK  ]   9469ms  hits=0  深度学习卷积神经网络图像分类
+    ✓ [AND_OK  ]   3494ms  hits=5  人类基因组计划测序技术发展
+    ✓ [AND_OK  ]   4712ms  hits=5  经济学博弈论纳什均衡应用
+    ✓ [OR_FALL ]   7685ms  hits=5  量子计算基本原理介绍
+    ✓ [OR_FALL ]   3309ms  hits=5  机器学习方法分析
+    ✓ [OR_FALL ]   8247ms  hits=5  历史发展研究
+    ✓ [SHORT   ]   4045ms  hits=5  相对论
+    ✓ [SHORT   ]   3805ms  hits=5  光合作用
+    ✓ [LONG    ]   7185ms  hits=5  请详细介绍量子力学中薛定谔方程的推导过程以及它在氢原子能级计
+    ✓ [LONG    ]   4810ms  hits=5  中国古代四大发明造纸术印刷术火药指南针对世界文明的深远影响和
+    ✓ [AND_OK  ]   4489ms  hits=5  量子纠缠实验验证贝尔不等式
+    ✓ [AND_OK  ]   4689ms  hits=5  北宋王安石变法历史背景
+    ✓ [AND_OK  ]   9355ms  hits=0  深度学习卷积神经网络图像分类
+    ✓ [AND_OK  ]   3293ms  hits=5  人类基因组计划测序技术发展
+    ✓ [AND_OK  ]   4446ms  hits=5  经济学博弈论纳什均衡应用
+    ✓ [OR_FALL ]   7145ms  hits=5  量子计算基本原理介绍
+    ✓ [OR_FALL ]   3300ms  hits=5  机器学习方法分析
+    ✓ [OR_FALL ]   8246ms  hits=5  历史发展研究
+    ✓ [SHORT   ]   3951ms  hits=5  相对论
+    ✓ [SHORT   ]   3776ms  hits=5  光合作用
+    ✓ [LONG    ]   7446ms  hits=5  请详细介绍量子力学中薛定谔方程的推导过程以及它在氢原子能级计
+    ✓ [LONG    ]   4900ms  hits=5  中国古代四大发明造纸术印刷术火药指南针对世界文明的深远影响和
+    ✓ [AND_OK  ]   4642ms  hits=5  量子纠缠实验验证贝尔不等式
+    ✓ [AND_OK  ]   4727ms  hits=5  北宋王安石变法历史背景
+    ✓ [AND_OK  ]   9357ms  hits=0  深度学习卷积神经网络图像分类
+    ✓ [AND_OK  ]   3320ms  hits=5  人类基因组计划测序技术发展
+
+并发=2, 共 40 请求...
+
+    ✓ [AND_OK  ]   7983ms  hits=5  北宋王安石变法历史背景
+    ✓ [AND_OK  ]  10787ms  hits=5  量子纠缠实验验证贝尔不等式
+    ✓ [AND_OK  ]   3285ms  hits=5  人类基因组计划测序技术发展
+    ✓ [AND_OK  ]  14036ms  hits=0  深度学习卷积神经网络图像分类
+    ✓ [AND_OK  ]   9779ms  hits=5  经济学博弈论纳什均衡应用
+    ✓ [OR_FALL ]   3588ms  hits=5  机器学习方法分析
+    ✓ [OR_FALL ]  10628ms  hits=5  量子计算基本原理介绍
+    ✓ [OR_FALL ]   8587ms  hits=5  历史发展研究
+    ✓ [SHORT   ]   7023ms  hits=5  光合作用
+    ✓ [SHORT   ]  11589ms  hits=5  相对论
+    ✓ [LONG    ]   5527ms  hits=5  中国古代四大发明造纸术印刷术火药指南针对世界文明的深远影响和
+    ✓ [LONG    ]  11162ms  hits=5  请详细介绍量子力学中薛定谔方程的推导过程以及它在氢原子能级计
+    ✓ [AND_OK  ]   9403ms  hits=5  北宋王安石变法历史背景
+    ✓ [AND_OK  ]  15668ms  hits=5  量子纠缠实验验证贝尔不等式
+    ✓ [AND_OK  ]   3670ms  hits=5  人类基因组计划测序技术发展
+    ✓ [AND_OK  ]   7588ms  hits=5  经济学博弈论纳什均衡应用
+    ✓ [AND_OK  ]  15273ms  hits=0  深度学习卷积神经网络图像分类
+    ✓ [OR_FALL ]   4936ms  hits=5  机器学习方法分析
+    ✓ [OR_FALL ]  10249ms  hits=5  量子计算基本原理介绍
+    ✓ [SHORT   ]   4250ms  hits=5  相对论
+    ✓ [SHORT   ]   7115ms  hits=5  光合作用
+    ✓ [OR_FALL ]  15899ms  hits=5  历史发展研究
+    ✓ [LONG    ]   7491ms  hits=5  中国古代四大发明造纸术印刷术火药指南针对世界文明的深远影响和
+    ✓ [LONG    ]  13563ms  hits=5  请详细介绍量子力学中薛定谔方程的推导过程以及它在氢原子能级计
+    ✓ [AND_OK  ]   9009ms  hits=5  北宋王安石变法历史背景
+    ✓ [AND_OK  ]  15703ms  hits=5  量子纠缠实验验证贝尔不等式
+    ✓ [AND_OK  ]   3763ms  hits=5  人类基因组计划测序技术发展
+    ✓ [AND_OK  ]   6545ms  hits=5  经济学博弈论纳什均衡应用
+    ✓ [AND_OK  ]  14464ms  hits=0  深度学习卷积神经网络图像分类
+    ✓ [OR_FALL ]   5294ms  hits=5  机器学习方法分析
+    ✓ [OR_FALL ]   9273ms  hits=5  量子计算基本原理介绍
+    ✓ [SHORT   ]   4052ms  hits=5  相对论
+    ✓ [SHORT   ]   6643ms  hits=5  光合作用
+    ✓ [OR_FALL ]  14844ms  hits=5  历史发展研究
+    ✓ [LONG    ]   6299ms  hits=5  中国古代四大发明造纸术印刷术火药指南针对世界文明的深远影响和
+    ✓ [LONG    ]  13240ms  hits=5  请详细介绍量子力学中薛定谔方程的推导过程以及它在氢原子能级计
+    ✓ [AND_OK  ]   9929ms  hits=5  北宋王安石变法历史背景
+    ✓ [AND_OK  ]  16620ms  hits=5  量子纠缠实验验证贝尔不等式
+    ✓ [AND_OK  ]   3754ms  hits=5  人类基因组计划测序技术发展
+    ✓ [AND_OK  ]  11883ms  hits=0  深度学习卷积神经网络图像分类
+
+并发=4, 共 40 请求...
+
+    ✓ [AND_OK  ]   4744ms  hits=5  人类基因组计划测序技术发展
+    ✓ [AND_OK  ]  15959ms  hits=5  北宋王安石变法历史背景
+    ✓ [AND_OK  ]  17843ms  hits=5  量子纠缠实验验证贝尔不等式
+    ✓ [AND_OK  ]  17851ms  hits=0  深度学习卷积神经网络图像分类
+    ✓ [OR_FALL ]   3881ms  hits=5  机器学习方法分析
+    ✓ [AND_OK  ]  28180ms  hits=5  经济学博弈论纳什均衡应用
+    ✓ [SHORT   ]  16238ms  hits=5  相对论
+    ✓ [OR_FALL ]  20167ms  hits=5  历史发展研究
+    ✓ [OR_FALL ]  22062ms  hits=5  量子计算基本原理介绍
+    ✗ [LONG    ]   5268ms  hits=0  请详细介绍量子力学中薛定谔方程的推导过程以及它在氢原子能级计
+    ✓ [SHORT   ]  15345ms  hits=5  光合作用
+    ✓ [LONG    ]  13093ms  hits=5  中国古代四大发明造纸术印刷术火药指南针对世界文明的深远影响和
+    ✓ [AND_OK  ]  14530ms  hits=5  量子纠缠实验验证贝尔不等式
+    ✓ [AND_OK  ]   9541ms  hits=5  人类基因组计划测序技术发展
+    ✓ [AND_OK  ]  13836ms  hits=5  经济学博弈论纳什均衡应用
+    ✓ [AND_OK  ]  25017ms  hits=5  北宋王安石变法历史背景
+    ✓ [AND_OK  ]  21024ms  hits=0  深度学习卷积神经网络图像分类
+    ✓ [SHORT   ]   7343ms  hits=5  相对论
+    ✓ [OR_FALL ]  13185ms  hits=5  机器学习方法分析
+    ✓ [OR_FALL ]  22359ms  hits=5  量子计算基本原理介绍
+    ✓ [OR_FALL ]  15208ms  hits=5  历史发展研究
+    ✓ [SHORT   ]  18669ms  hits=5  光合作用
+    ✓ [LONG    ]  15886ms  hits=5  中国古代四大发明造纸术印刷术火药指南针对世界文明的深远影响和
+    ✓ [LONG    ]  20833ms  hits=5  请详细介绍量子力学中薛定谔方程的推导过程以及它在氢原子能级计
+    ✓ [AND_OK  ]  17287ms  hits=5  量子纠缠实验验证贝尔不等式
+    ✓ [AND_OK  ]   5837ms  hits=5  人类基因组计划测序技术发展
+    ✓ [AND_OK  ]  20566ms  hits=5  北宋王安石变法历史背景
+    ✓ [AND_OK  ]  15137ms  hits=5  经济学博弈论纳什均衡应用
+    ✓ [AND_OK  ]  18151ms  hits=0  深度学习卷积神经网络图像分类
+    ✓ [SHORT   ]   7165ms  hits=5  相对论
+    ✓ [OR_FALL ]  11593ms  hits=5  机器学习方法分析
+    ✓ [OR_FALL ]  24709ms  hits=5  量子计算基本原理介绍
+    ✓ [OR_FALL ]  15451ms  hits=5  历史发展研究
+    ✓ [SHORT   ]  19529ms  hits=5  光合作用
+    ✓ [LONG    ]  16262ms  hits=5  中国古代四大发明造纸术印刷术火药指南针对世界文明的深远影响和
+    ✓ [LONG    ]  21308ms  hits=5  请详细介绍量子力学中薛定谔方程的推导过程以及它在氢原子能级计
+    ✓ [AND_OK  ]  17874ms  hits=5  量子纠缠实验验证贝尔不等式
+    ✓ [AND_OK  ]   7247ms  hits=5  人类基因组计划测序技术发展
+    ✓ [AND_OK  ]  17100ms  hits=5  北宋王安石变法历史背景
+    ✓ [AND_OK  ]  15856ms  hits=0  深度学习卷积神经网络图像分类
+
+并发=8, 共 40 请求...
+
+    ✓ [AND_OK  ]   7720ms  hits=5  人类基因组计划测序技术发展
+    ✓ [OR_FALL ]  11885ms  hits=5  机器学习方法分析
+    ✓ [AND_OK  ]  15928ms  hits=5  量子纠缠实验验证贝尔不等式
+    ✓ [OR_FALL ]  15930ms  hits=5  量子计算基本原理介绍
+    ✓ [AND_OK  ]  29235ms  hits=5  经济学博弈论纳什均衡应用
+    ✓ [AND_OK  ]  33379ms  hits=5  北宋王安石变法历史背景
+    ✓ [AND_OK  ]  34917ms  hits=0  深度学习卷积神经网络图像分类
+    ✓ [OR_FALL ]  34918ms  hits=5  历史发展研究
+    ✓ [SHORT   ]  40896ms  hits=5  相对论
+    ✓ [LONG    ]  36898ms  hits=5  中国古代四大发明造纸术印刷术火药指南针对世界文明的深远影响和
+    ✓ [SHORT   ]  40965ms  hits=5  光合作用
+    ✓ [LONG    ]  37424ms  hits=5  请详细介绍量子力学中薛定谔方程的推导过程以及它在氢原子能级计
+    ✓ [AND_OK  ]  23572ms  hits=5  人类基因组计划测序技术发展
+    ✓ [AND_OK  ]  36157ms  hits=5  北宋王安石变法历史背景
+    ✓ [AND_OK  ]  42551ms  hits=5  量子纠缠实验验证贝尔不等式
+    ✓ [AND_OK  ]  36874ms  hits=0  深度学习卷积神经网络图像分类
+    ✓ [OR_FALL ]  24063ms  hits=5  机器学习方法分析
+    ✓ [AND_OK  ]  37437ms  hits=5  经济学博弈论纳什均衡应用
+    ✓ [OR_FALL ]  35502ms  hits=5  量子计算基本原理介绍
+    ✓ [OR_FALL ]  34986ms  hits=5  历史发展研究
+    ✓ [SHORT   ]  42739ms  hits=5  相对论
+    ✓ [SHORT   ]  35589ms  hits=5  光合作用
+    ✓ [LONG    ]  35098ms  hits=5  中国古代四大发明造纸术印刷术火药指南针对世界文明的深远影响和
+    ✓ [LONG    ]  35260ms  hits=5  请详细介绍量子力学中薛定谔方程的推导过程以及它在氢原子能级计
+    ✓ [AND_OK  ]  23604ms  hits=5  人类基因组计划测序技术发展
+    ✓ [AND_OK  ]  35819ms  hits=5  北宋王安石变法历史背景
+    ✓ [AND_OK  ]  47514ms  hits=5  量子纠缠实验验证贝尔不等式
+    ✓ [AND_OK  ]  36695ms  hits=0  深度学习卷积神经网络图像分类
+    ✓ [OR_FALL ]  26994ms  hits=5  机器学习方法分析
+    ✓ [AND_OK  ]  36076ms  hits=5  经济学博弈论纳什均衡应用
+    ✓ [OR_FALL ]  35836ms  hits=5  量子计算基本原理介绍
+    ✓ [OR_FALL ]  33982ms  hits=5  历史发展研究
+    ✓ [SHORT   ]  42916ms  hits=5  相对论
+    ✓ [LONG    ]  33752ms  hits=5  中国古代四大发明造纸术印刷术火药指南针对世界文明的深远影响和
+    ✓ [SHORT   ]  36909ms  hits=5  光合作用
+    ✓ [LONG    ]  34475ms  hits=5  请详细介绍量子力学中薛定谔方程的推导过程以及它在氢原子能级计
+    ✓ [AND_OK  ]  22712ms  hits=5  人类基因组计划测序技术发展
+    ✓ [AND_OK  ]  36829ms  hits=5  北宋王安石变法历史背景
+    ✓ [AND_OK  ]  42218ms  hits=5  量子纠缠实验验证贝尔不等式
+    ✓ [AND_OK  ]  35881ms  hits=0  深度学习卷积神经网络图像分类
+
+
+─────────────────────────────────────────────────────────────────
+  汇总（所有并发梯度）
+─────────────────────────────────────────────────────────────────
+  concurrency= 1 | RPS=  0.2 | p50=  4803ms  p90=  9355ms  p99=  9725ms  max=  9725ms | err=0/40
+  concurrency= 2 | RPS=  0.2 | p50=  9273ms  p90= 15668ms  p99= 16620ms  max= 16620ms | err=0/40
+  concurrency= 4 | RPS=  0.2 | p50= 16238ms  p90= 22359ms  p99= 28180ms  max= 28180ms | err=1/40
+  concurrency= 8 | RPS=  0.2 | p50= 35589ms  p90= 42551ms  p99= 47514ms  max= 47514ms | err=0/40
+
+  注: 用 --verbose 查看每条请求的 tag 和命中数
