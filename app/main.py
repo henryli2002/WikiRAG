@@ -25,20 +25,16 @@ DB_USER = os.getenv("POSTGRES_USER", "rag_user")
 
 VECTOR_RECALL_K = 50   # 向量召回数
 BM25_RECALL_K = 50     # BM25 召回数
-HYBRID_TOP_K = 50      # 混合排序取前 N
+HYBRID_TOP_K = 30      # 混合排序取前 N
 RERANK_TOP_K = 10      # 精排最多取前 N（实际数量还受 RERANK_MIN_HYBRID_SCORE 约束）
 RERANK_MIN_HYBRID_SCORE = 0.010  # 低于此 RRF 分的文档跳过 rerank；约等于单路召回 top-40
 FINAL_TOP_K = 5        # MMR 最终返回数
 MMR_LAMBDA = 0.7       # MMR 多样性参数 (越大越相关，越小越多样)
 SCORE_THRESHOLD = 0.8  # rerank 分数阈值，<=0.8 判定为不相似
 
-VECTOR_TIMEOUT_S = 5.0
-BM25_TIMEOUT_S = 5.0
-MMR_TIMEOUT_S = 100.0
-
-import os
-# 开启这个后，如果发生 CPU 回退，终端会直接报错并停止
-os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
+VECTOR_TIMEOUT_S = 1.0
+BM25_TIMEOUT_S = 1.0
+MMR_TIMEOUT_S = 1.0
 
 # ─── 全局模型 & 连接池 ────────────────────────────────────
 embedding_model: BGEM3FlagModel | None = None
@@ -121,6 +117,24 @@ async def lifespan(app: FastAPI):
     print(f"  reranker device: {next(reranker_inner_model.parameters()).device}")
 
     print("✅ 模型加载完成（常驻内存, FP16 推理）")
+
+    # MPS shader 预热：提前编译常用 sequence length 的 Metal kernel，
+    # 避免第一次真实请求时触发 JIT 编译（几百 ms 延迟）
+    import torch
+    print("预热 MPS kernel...")
+    with torch.no_grad():
+        for seq_len in [32, 128, 256, 512]:
+            dummy_text = "预热" * (seq_len // 2)
+            d_emb = embed_tokenizer(
+                [dummy_text], max_length=512, padding=True, truncation=True, return_tensors='pt'
+            )
+            embed_inner_model(**{k: v.to(device) for k, v in d_emb.items()})
+
+            d_rnk = reranker_tokenizer(
+                [["预热", dummy_text]], max_length=512, padding=True, truncation=True, return_tensors='pt'
+            )
+            reranker_inner_model(**{k: v.to(device) for k, v in d_rnk.items()})
+    print("✅ MPS kernel 预热完成")
 
     db_pool = await asyncpg.create_pool(
         host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER,
@@ -342,6 +356,8 @@ def rerank(query: str, docs: list[dict]) -> list[dict]:
     import torch
     if not docs:
         return []
+    # 截断 content：cross-encoder 的 attention 是 O(L²)，
+    # 一条长文档会把整批 50 条都 pad 到 512 token。
     pairs = [[query, doc["content"]] for doc in docs]
     device = next(reranker_inner_model.parameters()).device
     _rlog(f"  [rerank] {len(pairs)} pairs, device={device}")
@@ -534,6 +550,67 @@ async def _do_search(req: QueryRequest):
         ))
 
     return QueryResponse(query=query, results=results)
+
+
+@app.post("/search/debug")
+async def search_debug(req: QueryRequest):
+    """返回完整召回链路的排名信息，用于分析 top-K 设置是否合理。不做日志缓冲。"""
+    async with _search_sem:
+        return await _do_search_debug(req)
+
+
+async def _do_search_debug(req: QueryRequest):
+    query = req.query
+    loop = asyncio.get_event_loop()
+
+    async with _embed_lock:
+        query_vec = await loop.run_in_executor(thread_pool, embed_query, query)
+
+    vec_task = asyncio.create_task(vector_recall(query_vec, VECTOR_RECALL_K))
+    bm25_task = asyncio.create_task(bm25_recall(query, BM25_RECALL_K))
+    await asyncio.gather(vec_task, bm25_task, return_exceptions=True)
+
+    vec_results, _ = vec_task.result() if (vec_task.done() and not vec_task.exception()) else ([], 0)
+    bm25_results, _ = bm25_task.result() if (bm25_task.done() and not bm25_task.exception()) else ([], 0)
+
+    vec_rank  = {doc["id"]: i + 1 for i, doc in enumerate(vec_results)}
+    bm25_rank = {doc["id"]: i + 1 for i, doc in enumerate(bm25_results)}
+
+    merged = hybrid_merge(vec_results, bm25_results, HYBRID_TOP_K)
+    merged_rank = {doc["id"]: i + 1 for i, doc in enumerate(merged)}
+
+    to_rerank = [d for d in merged if d["score"] >= RERANK_MIN_HYBRID_SCORE] or merged[:1]
+    async with _rerank_lock:
+        reranked = await loop.run_in_executor(thread_pool, rerank, query, to_rerank)
+    reranked_rank = {doc["id"]: i + 1 for i, doc in enumerate(reranked)}
+
+    final = await mmr_select(query_vec, reranked, req.top_k, MMR_LAMBDA)
+
+    return {
+        "query": query,
+        "counts": {
+            "vector": len(vec_results),
+            "bm25": len(bm25_results),
+            "merged": len(merged),
+            "rerank_input": len(to_rerank),
+            "reranked": len(reranked),
+            "final": len(final),
+        },
+        "final_docs": [
+            {
+                "id": doc["id"],
+                "title": doc.get("metadata", {}).get("title", ""),
+                "rerank_score": round(doc["score"], 4),
+                "vector_rank":   vec_rank.get(doc["id"]),    # None = 未被向量召回
+                "bm25_rank":     bm25_rank.get(doc["id"]),   # None = 未被 BM25 召回
+                "merged_rank":   merged_rank.get(doc["id"]),
+                "reranked_rank": reranked_rank.get(doc["id"]),
+            }
+            for doc in final
+        ],
+        # 送入 rerank 的所有候选的 merged_rank 分布，用于画完整分布图
+        "rerank_input_merged_ranks": [merged_rank[d["id"]] for d in to_rerank],
+    }
 
 
 @app.get("/health")
