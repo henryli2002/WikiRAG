@@ -36,11 +36,21 @@ VECTOR_TIMEOUT_S = 5.0
 BM25_TIMEOUT_S = 5.0
 MMR_TIMEOUT_S = 100.0
 
+import os
+# 开启这个后，如果发生 CPU 回退，终端会直接报错并停止
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
+
 # ─── 全局模型 & 连接池 ────────────────────────────────────
 embedding_model: BGEM3FlagModel | None = None
 reranker_model: FlagReranker | None = None
 thread_pool = ThreadPoolExecutor(max_workers=8)
 db_pool: asyncpg.Pool | None = None
+
+# 底层模型和分词器（供直接调用，绕过 FlagEmbedding 封装）
+reranker_inner_model = None
+reranker_tokenizer = None
+embed_inner_model = None
+embed_tokenizer = None
 
 _embedding_col_type: str | None = None
 
@@ -89,17 +99,27 @@ def _get_device() -> str:
 async def lifespan(app: FastAPI):
     global embedding_model, reranker_model, db_pool, _embedding_col_type
     global _search_sem, _embed_lock, _rerank_lock
+    global reranker_inner_model, reranker_tokenizer, embed_inner_model, embed_tokenizer
 
     device = _get_device()
     print(f"推理设备: {device}")
+
     print("加载 embedding 模型...")
     embedding_model = BGEM3FlagModel(EMBEDDING_MODEL_PATH, use_fp16=True)
     embedding_model.model.to(device)
-    print(f"  embedding device: {next(embedding_model.model.parameters()).device}")
+    embedding_model.model.model.eval()
+    embed_inner_model = embedding_model.model.model  # 底层 AutoModel (XLM-RoBERTa)
+    embed_tokenizer = embedding_model.tokenizer
+    print(f"  embedding device: {next(embed_inner_model.parameters()).device}")
+
     print("加载 reranker 模型...")
-    reranker_model = FlagReranker(RERANKER_MODEL_PATH, use_fp16=True, batch_size=32)
+    reranker_model = FlagReranker(RERANKER_MODEL_PATH, use_fp16=True)
     reranker_model.model.to(device)
-    print(f"  reranker device: {next(reranker_model.model.parameters()).device}")
+    reranker_model.model.eval()
+    reranker_inner_model = reranker_model.model   # 底层 AutoModelForSequenceClassification
+    reranker_tokenizer = reranker_model.tokenizer
+    print(f"  reranker device: {next(reranker_inner_model.parameters()).device}")
+
     print("✅ 模型加载完成（常驻内存, FP16 推理）")
 
     db_pool = await asyncpg.create_pool(
@@ -154,8 +174,18 @@ class QueryResponse(BaseModel):
 # ─── 核心函数 ────────────────────────────────────────────
 
 def embed_query(query: str) -> list[float]:
-    out = embedding_model.encode([query], max_length=512)
-    return out["dense_vecs"][0].tolist()
+    import torch
+    device = next(embed_inner_model.parameters()).device
+    inputs = embed_tokenizer(
+        [query], max_length=512, padding=True, truncation=True, return_tensors='pt'
+    )
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    with torch.no_grad():
+        outputs = embed_inner_model(**inputs)
+    # BGE-M3 dense 向量：CLS token 隐状态，L2 归一化
+    cls_hidden = outputs.last_hidden_state[:, 0]
+    embedding = torch.nn.functional.normalize(cls_hidden, p=2, dim=-1)
+    return embedding[0].cpu().float().tolist()
 
 
 async def vector_recall(query_vec: list[float], k: int) -> tuple[list[dict], float]:
@@ -309,14 +339,19 @@ def rerank(query: str, docs: list[dict]) -> list[dict]:
     """Cross-encoder 精排（模型常驻内存，batch FP16 串行推理）。
     调用方须持有 _rerank_lock，确保同时只有一个推理任务在跑。
     """
+    import torch
     if not docs:
         return []
     pairs = [[query, doc["content"]] for doc in docs]
-    _rlog(f"  [rerank] {len(pairs)} pairs, "
-          f"batch_size={reranker_model.batch_size}, "
-          f"device={next(reranker_model.model.parameters()).device}, "
-          f"fp16={reranker_model.use_fp16}")
-    scores = reranker_model.compute_score(pairs, normalize=True)
+    device = next(reranker_inner_model.parameters()).device
+    _rlog(f"  [rerank] {len(pairs)} pairs, device={device}")
+    inputs = reranker_tokenizer(
+        pairs, padding=True, truncation=True, max_length=512, return_tensors='pt'
+    )
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    with torch.no_grad():
+        outputs = reranker_inner_model(**inputs)
+    scores = torch.sigmoid(outputs.logits).squeeze(-1).cpu().float().tolist()
     if isinstance(scores, float):
         scores = [scores]
     for i, doc in enumerate(docs):
