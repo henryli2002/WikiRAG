@@ -55,7 +55,7 @@ def test_table_schema(cursor):
     assert "content" in columns
     assert "metadata" in columns
     assert "embedding" in columns
-    assert "tsv" in columns
+    assert "content_tokenized" in columns
 
 
 def test_embedding_not_null(cursor):

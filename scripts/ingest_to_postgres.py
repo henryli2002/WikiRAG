@@ -75,10 +75,9 @@ def _process_row(args):
     metadata_esc = _escape(metadata)
     embedding = "[" + ",".join(str(float(x)) for x in embedding_list) + "]"
 
-    title_seg = _escape(_segment(str(title)))
-    content_seg = _escape(_segment(str(content)))
+    content_tokenized = _escape(_segment(str(content)))
 
-    return f"{content_esc}\t{metadata_esc}\t{embedding}\t{title_seg}\t{content_seg}\n"
+    return f"{content_esc}\t{metadata_esc}\t{embedding}\t{content_tokenized}\n"
 
 
 def main():
@@ -98,9 +97,7 @@ def main():
             content TEXT NOT NULL,
             metadata JSONB NOT NULL DEFAULT '{}',
             embedding HALFVEC(1024),
-            title_seg TEXT NOT NULL DEFAULT '',
-            content_seg TEXT NOT NULL DEFAULT '',
-            tsv TSVECTOR
+            content_tokenized TEXT NOT NULL DEFAULT ''
         );
     """)
 
@@ -133,7 +130,7 @@ def main():
         cursor.copy_from(
             buf,
             table="wiki_documents",
-            columns=("content", "metadata", "embedding", "title_seg", "content_seg"),
+            columns=("content", "metadata", "embedding", "content_tokenized"),
             sep="\t",
             null="\\N",
         )

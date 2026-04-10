@@ -1,6 +1,6 @@
 # WikiRAG: 中文维基百科检索系统
 
-基于中文维基百科全量数据构建的检索系统。从原始 Wikipedia dump 出发，经过数据清洗、向量化、入库，提供向量 + 全文混合召回、精排、MMR 去重的检索 API。
+基于中文维基百科全量数据构建的检索系统。从原始 Wikipedia dump 出发，经过数据清洗、向量化、入库，提供向量 + BM25 混合召回、精排、MMR 去重的检索 API。
 
 ## 系统架构
 
@@ -22,10 +22,10 @@
 │  embed_factory.py ───── 文本分块 + BGE-M3 向量化 (FP16)   │
 │        │                                                │
 │        ▼                                                │
-│  ingest_to_postgres.py ─ 多进程分词 + COPY 批量入库        │
+│  ingest_to_postgres.py ─ 多进程 jieba 分词 + COPY 批量入库 │
 │        │                                                │
 │        ▼                                                │
-│  build_index.py ──────── tsvector + GIN + 向量索引构建     │
+│  build_index.py ──────── GIN + HNSW + BM25 索引构建       │
 │                                                         │
 └─────────────────────────────────────────────────────────┘
 
@@ -40,7 +40,7 @@
 │             ┌───────────┴───────────┐                   │
 │             ▼                       ▼                   │
 │      向量召回 (top 50)         BM25 召回 (top 10)         │
-│      pgvector 余弦距离        simple + ts_rank           │
+│      pgvector 余弦距离        pg_search / Tantivy        │
 │             │                       │                   │
 │             └───────────┬───────────┘                   │
 │                         ▼                               │
@@ -67,10 +67,10 @@
 | 向量模型 | BAAI/bge-m3 | 1024 维, FP16 推理 |
 | 精排模型 | BAAI/bge-reranker-v2-m3 | Cross-Encoder |
 | 向量数据库 | PostgreSQL + pgvector | HNSW 索引，halfvec 存储 |
-| 全文检索 | PostgreSQL ts_rank + GIN | jieba 分词 + simple 字典，标题 A 权重 / 内容 B 权重 |
+| 全文检索 | pg_search (ParadeDB / Tantivy) | 真正的 BM25：IDF + TF 饱和 + 长度归一化 |
+| 中文分词 | jieba | 入库时多进程并行分词，写入 content_tokenized 列 |
 | 文本分块 | RecursiveCharacterTextSplitter | 512 字符, 60 字符重叠 |
-| 中文分词 | jieba | 多进程并行分词 |
-| API 框架 | FastAPI + Uvicorn | |
+| API 框架 | FastAPI + asyncpg | 异步连接池，请求并发控制 |
 | 繁简转换 | OpenCC | |
 
 ## 目录结构
@@ -80,11 +80,11 @@ WikiRAG/
 ├── app/
 │   └── main.py                  # FastAPI 检索 API
 ├── scripts/
-│   ├── auto_wiki_parser.py      # 步骤 2: XML 解析
-│   ├── clean_brackets.py        # 步骤 3: 噪音清洗
-│   ├── embed_factory.py         # 步骤 5: 向量化
-│   ├── ingest_to_postgres.py    # 步骤 6: 批量入库
-│   ├── build_index.py           # 步骤 7: 索引构建
+│   ├── auto_wiki_parser.py      # 步骤 1: XML 解析
+│   ├── clean_brackets.py        # 步骤 2: 噪音清洗
+│   ├── embed_factory.py         # 步骤 3: 向量化
+│   ├── ingest_to_postgres.py    # 步骤 4: 批量入库（含 jieba 分词）
+│   ├── build_index.py           # 步骤 5: 索引构建
 │   └── stress_test.py           # 压力测试（需 pip install httpx）
 ├── postgres/
 │   └── init.sql                 # 数据库初始化 DDL
@@ -97,7 +97,6 @@ WikiRAG/
 │   └── pgdata/                  # PostgreSQL 数据卷挂载
 ├── tests/                       # 单元测试
 ├── docker-compose.yml
-├── download_embedding_model.py
 ├── requirements.txt
 └── .env
 ```
@@ -114,8 +113,9 @@ git clone <repo-url> && cd WikiRAG
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# 启动数据库
-docker-compose up -d
+# 启动数据库（paradedb 镜像，内置 pgvector + pg_search）
+mkdir -p data/pgdata && chmod 777 data/pgdata
+docker compose up -d
 
 # 下载模型 (BGE-M3 + BGE-Reranker)
 python download_embedding_model.py
@@ -123,10 +123,8 @@ python download_embedding_model.py
 
 ### 数据处理流水线
 
-详细步骤见 [`scripts/README.md`](scripts/README.md)。
-
 ```bash
-# 1. 准备原始数据: 将 zhwiki dump 放入 data/raw/
+# 1. 将 zhwiki dump 放入 data/raw/
 
 # 2. XML 解析 → JSONL
 python scripts/auto_wiki_parser.py
@@ -134,13 +132,13 @@ python scripts/auto_wiki_parser.py
 # 3. 噪音清洗
 python scripts/clean_brackets.py
 
-# 4. 向量化 (耗时较长，支持断点续传)
+# 4. 向量化（耗时较长，支持断点续传）
 python scripts/embed_factory.py
 
-# 5. 批量入库 (多进程分词 + COPY, MBP M4 Pro / Colima 6GB 约 30 分钟)
+# 5. 批量入库（多进程 jieba 分词直接写入 content_tokenized，约 30 分钟）
 python scripts/ingest_to_postgres.py
 
-# 6. 构建索引（含 ANALYZE）
+# 6. 构建索引（HNSW 约 3 小时，BM25 约 1.5 分钟）
 python scripts/build_index.py
 ```
 
@@ -207,30 +205,27 @@ curl -X POST http://localhost:8000/search \
 
 | 指标 | 数值 |
 |------|------|
-| 入库行数（文本块） | 2,787,678 |
-| 表堆大小 | 3.5 GB |
-| 索引合计 | ~19 GB |
-| 表 + 索引总计 | 22 GB |
+| 入库行数（文本块） | 2,784,657 |
+| 表堆大小 | ~3.5 GB |
 
 ### 索引大小（实测）
 
 | 索引 | 类型 | 大小 |
 |------|------|------|
 | idx_emb_hnsw_fp16_1024_m16_ef32 | HNSW halfvec cosine | 7.25 GB |
-| idx_wiki_documents_tsv | GIN tsvector | 1.04 GB |
-| idx_wiki_documents_metadata | GIN jsonb | 185 MB |
-| wiki_documents_pkey | B-tree bigserial | 60 MB |
+| idx_wiki_bm25 | BM25 (pg_search / Tantivy) | — |
+| idx_wiki_documents_metadata | GIN jsonb | ~185 MB |
+| wiki_documents_pkey | B-tree bigserial | ~60 MB |
 
 ### 数据处理耗时（参考）
 
 | 阶段 | 耗时 | 环境 |
 |------|------|------|
 | 向量化 | ~18 小时 42 分钟 | RTX 3070 Laptop 140W, 8GB VRAM |
-| 批量入库 | ~30 分钟 | MBP M4 Pro, Colima 6GB |
-| 构建 tsvector | 7 分 7 秒 | MBP M4 Pro, Colima 6GB |
-| tsv GIN 索引 | 4 分 0 秒 | MBP M4 Pro, Colima 6GB |
-| metadata GIN 索引 | 1 分 10 秒 | MBP M4 Pro, Colima 6GB |
-| HNSW 向量索引 (fp16, m=16, ef=32) | 待补充 | — |
+| 批量入库（含 jieba 分词） | ~30 分钟 | MBP M4 Pro, Docker Desktop |
+| metadata GIN 索引 | 12 秒 | MBP M4 Pro, Docker Desktop |
+| HNSW 向量索引 (fp16, m=16, ef=32) | 184 分 53 秒 | MBP M4 Pro, Docker Desktop |
+| BM25 索引 (pg_search) | 1 分 30 秒 | MBP M4 Pro, Docker Desktop |
 
 ## 实现细节
 
@@ -238,28 +233,31 @@ curl -X POST http://localhost:8000/search \
 
 ```sql
 CREATE TABLE wiki_documents (
-    id         BIGSERIAL PRIMARY KEY,
-    content    TEXT NOT NULL,          -- 分块后的文本 (含标题前缀)
-    metadata   JSONB NOT NULL,         -- {"pageid": ..., "title": ...}
-    embedding  HALFVEC(1024),          -- BGE-M3 稠密向量，FP16 存储
-    tsv        TSVECTOR                -- 全文检索向量 (title=A, content=B)
+    id                BIGSERIAL PRIMARY KEY,
+    content           TEXT NOT NULL,          -- 分块后的文本（含标题前缀）
+    metadata          JSONB NOT NULL,          -- {"pageid": ..., "title": ...}
+    embedding         HALFVEC(1024),           -- BGE-M3 稠密向量，FP16 存储
+    content_tokenized TEXT NOT NULL DEFAULT '' -- jieba 空格分词结果，供 BM25 索引
 );
 ```
 
-入库时还有两个临时列 `title_seg`、`content_seg`（存 jieba 分词结果），`build_index.py` 构建完 tsv 后会 DROP 掉。
+`content_tokenized` 在 `ingest_to_postgres.py` 入库时由多进程 jieba 直接填充，无需后续迁移步骤。
 
-### 2. 全文检索方案
+### 2. BM25 检索方案
 
-无需安装 zhparser 等中文分词扩展。核心思路：**Python 端分词，PostgreSQL 端当英文处理**。
+使用 ParadeDB 的 `pg_search` 扩展（基于 Tantivy），在 `content_tokenized` 列上建 BM25 索引，使用 whitespace tokenizer。
 
-- **入库时**：jieba 分词 → 空格连接 → 存入临时列 → `to_tsvector('simple', ...)` 生成 tsvector
-- **标题权重 A** (1.0)，**内容权重 B** (0.4)：`setweight(..., 'A') || setweight(..., 'B')`
-- **查询时**：jieba 分词 → 去停用词、去重 → 先尝试 AND，结果不足则 OR 回退
-- **OR 回退限制**：按词长降序取最多 4 个词，候选行数上限 500，避免对大量命中行做全量 ts_rank 排序
+- **入库时**：jieba 分词 → 空格连接 → 写入 `content_tokenized`
+- **查询时**：jieba 分词 → 去停用词/去重 → 先尝试 AND（所有词必须出现），结果不足则 OR 回退（按词长降序取最多 4 词）
+- **评分**：Tantivy BM25 原生评分（IDF + TF 饱和 + 长度归一化），由 `paradedb.score(id)` 返回
+
+与旧方案（PostgreSQL ts_rank + GIN tsvector）相比：
+- 有真正的 IDF，高频词自动降权，不再需要手工停用词 hack
+- 长文档不会因 term 频次绝对值高而虚高
 
 ### 3. 向量索引
 
-向量以 `halfvec(1024)` 存储（FP16），查询时按列存储类型 cast 后做余弦距离计算。
+向量以 `halfvec(1024)` 存储（FP16），查询时做余弦距离计算。
 
 `build_index.py` 支持多种索引配置，可共存：
 
@@ -286,7 +284,7 @@ FROM pg_indexes WHERE tablename = 'wiki_documents' AND indexname LIKE 'idx_emb_%
 |------|------|------|
 | Query Embedding | BGE-M3 FP16 | 1024 维稠密向量 |
 | 向量召回 | top 50 | pgvector 余弦距离 |
-| BM25 召回 | top 10 | PostgreSQL ts_rank + GIN 索引 |
+| BM25 召回 | top 10 | pg_search BM25，AND 优先，OR 回退 |
 | 混合排分 | RRF k=60，取 top 32 | `score = Σ 1/(rank + 60)` |
 | 精排 | BGE-Reranker-v2-M3，取 top 10 | Cross-Encoder 逐对打分 |
 | MMR 去重 | λ=0.7，top 5 | `score = λ·relevance - (1-λ)·max_sim` |
@@ -305,10 +303,7 @@ pytest tests/ -v
 
 # 按模块测试
 pytest tests/test_db_connection.py -v    # 数据库连接与数据完整性
-pytest tests/test_vector_recall.py -v    # pgvector 向量召回
-pytest tests/test_bm25.py -v             # 全文检索 (simple + jieba)
-pytest tests/test_hybrid_merge.py -v     # RRF 混合排分 (纯逻辑)
-pytest tests/test_mmr.py -v              # MMR 多样性选择
+pytest tests/test_bm25.py -v             # BM25 检索 (pg_search)
 pytest tests/test_index.py -v            # 索引状态检查
 
 # 压力测试（需服务运行中）
@@ -318,10 +313,11 @@ python scripts/stress_test.py --concurrency 1 2 4 8 --requests 40 --verbose
 
 ## 部署配置
 
-### Docker (PostgreSQL + pgvector)
+### Docker (ParadeDB = PostgreSQL + pgvector + pg_search)
 
 ```yaml
 # docker-compose.yml 关键配置
+image: paradedb/paradedb:latest-pg17
 shared_buffers: 1GB
 work_mem: 32MB
 maintenance_work_mem: 256MB
@@ -329,7 +325,7 @@ max_wal_size: 4GB
 shm_size: 4gb
 ```
 
-> 以上为 Colima 6GB 内存虚拟机的保守配置。内存充裕时可适当调大 `shared_buffers` 和 `maintenance_work_mem`。
+> bind mount 在 macOS 上需提前 `mkdir -p data/pgdata && chmod 777 data/pgdata`，否则容器内 postgres 进程写堆文件时会报 Permission denied。
 
 ### 环境变量 (.env)
 
@@ -350,16 +346,15 @@ DB_PORT=5432
 | Python | 3.10+ | 3.12 | f-string、类型注解等语法依赖 |
 | PostgreSQL | 15+ | 17 | JSONB 等特性 |
 | pgvector | 0.7.0+ | 0.8.2 | halfvec、binary_quantize 需要 0.7+ |
+| pg_search | — | ParadeDB latest | Tantivy BM25 |
 | Docker | 20.10+ | — | docker-compose v2 |
-
-> **pgvector 版本**：halfvec 和二值量化需要 pgvector >= 0.7.0。推荐使用 `pgvector/pgvector:pg17` 官方镜像。
 
 ### Python 依赖
 
 | 包 | 最低版本 | 用途 |
 |---|---------|------|
 | FlagEmbedding | 1.3.4+ | BGE-M3 embedding + BGE-Reranker 精排 |
-| transformers | 4.38+, <5 | HuggingFace 模型加载 (v5 与 FlagEmbedding 不兼容) |
+| transformers | 4.38+, <5 | HuggingFace 模型加载 |
 | torch | 2.0+ | 推理框架，MPS/CUDA 加速 |
 | fastapi | 0.110+ | API 框架 |
 | uvicorn | 0.29+ | ASGI 服务器 |
@@ -371,3 +366,38 @@ DB_PORT=5432
 | numpy | 1.24+ | 向量运算 |
 | langchain-text-splitters | 0.2+ | 文本分块 |
 | pytest | 8.0+ | 测试 |
+
+---
+
+## Legacy
+
+<details>
+<summary>旧版方案（tsvector + ts_rank，已废弃）</summary>
+
+旧版 BM25 使用 PostgreSQL 原生 `tsvector` + `ts_rank` + GIN 索引，无真正的 IDF 和长度归一化。表结构中包含 `tsv TSVECTOR` 列，入库时生成两个临时列 `title_seg`/`content_seg`，`build_index.py` 构建完后再 DROP。
+
+### 旧版表结构
+
+```sql
+CREATE TABLE wiki_documents (
+    id         BIGSERIAL PRIMARY KEY,
+    content    TEXT NOT NULL,
+    metadata   JSONB NOT NULL,
+    embedding  HALFVEC(1024),
+    tsv        TSVECTOR   -- title=A, content=B 加权全文向量
+);
+```
+
+### 旧版流程
+
+```
+ingest_to_postgres.py  →  migrate_to_bm25.py  →  build_index.py
+（生成 title_seg/content_seg）  （填充 content_tokenized）  （删临时列，建索引）
+```
+
+废弃原因：
+- `ts_rank` 没有 IDF，高频词无法自动降权，依赖手工维护停用词表
+- 标题/内容双权重方案复杂但效果提升有限
+- 迁移脚本（`migrate_to_bm25.py`）使流程割裂，新建库时不再需要
+
+</details>

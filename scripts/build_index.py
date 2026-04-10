@@ -1,18 +1,16 @@
 """
 索引构建脚本（在全量数据导入后运行）：
-1. 从临时分词列构建 tsvector (title=A, content=B)
-2. 清理临时列
-3. 创建 GIN / 向量索引
-4. 将 UNLOGGED 表转为 LOGGED
+1. 创建 metadata GIN 索引
+2. 创建向量索引（HNSW / IVFFlat，支持 fp16 / fp32 / bit 量化）
+3. 创建 BM25 索引（pg_search，content_tokenized 列由 ingest_to_postgres.py 直接写入）
+4. ANALYZE 更新统计信息
 
 用法:
-  python scripts/build_index.py                           # 默认 HNSW
-  python scripts/build_index.py --method ivfflat          # IVFFlat default:1000
+  python scripts/build_index.py                           # 默认 HNSW fp16
+  python scripts/build_index.py --method ivfflat
   python scripts/build_index.py --method hnsw --m 32 --ef-construction 128
-  python scripts/build_index.py --method ivfflat --lists 2000
-  python scripts/build_index.py --method hnsw --quantize halfvec    # FP16 量化
-  python scripts/build_index.py --method hnsw --quantize bit        # 二值量化
-  python scripts/build_index.py --dim 512                           # PCA 降维到 512 维
+  python scripts/build_index.py --quantize bit            # 二值量化
+  python scripts/build_index.py --dim 512                 # 降维到 512 维
 """
 import os
 import time
@@ -72,23 +70,6 @@ def parse_args():
     return p.parse_args()
 
 
-@timed("构建 tsvector (title=A, content=B)")
-def build_tsvector(cursor, conn):
-    cursor.execute("""
-        UPDATE wiki_documents SET tsv =
-            setweight(to_tsvector('simple', title_seg), 'A') ||
-            setweight(to_tsvector('simple', content_seg), 'B');
-    """)
-    conn.commit()
-
-
-@timed("清理临时分词列")
-def drop_seg_columns(cursor, conn):
-    cursor.execute("ALTER TABLE wiki_documents DROP COLUMN title_seg;")
-    cursor.execute("ALTER TABLE wiki_documents DROP COLUMN content_seg;")
-    conn.commit()
-
-
 @timed("创建 metadata GIN 索引")
 def create_metadata_index(cursor, conn):
     cursor.execute("""
@@ -97,14 +78,6 @@ def create_metadata_index(cursor, conn):
     """)
     conn.commit()
 
-
-@timed("创建 tsv GIN 索引")
-def create_tsv_index(cursor, conn):
-    cursor.execute("""
-        CREATE INDEX IF NOT EXISTS idx_wiki_documents_tsv
-        ON wiki_documents USING gin (tsv);
-    """)
-    conn.commit()
 
 
 def create_vector_index(cursor, conn, args):
@@ -178,6 +151,41 @@ def create_vector_index(cursor, conn, args):
 
 
 
+@timed("创建 BM25 索引 (pg_search / Tantivy)")
+def create_bm25_index(cursor, conn):
+    """使用 pg_search 扩展构建真正的 BM25 索引（有 IDF、TF 饱和、长度归一化）。
+    索引基于 content_tokenized 列（jieba 空格分词），使用 whitespace tokenizer。
+    若 pg_search 未安装则跳过。
+    """
+    cursor.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_search';")
+    if not cursor.fetchone():
+        print("  ⚠ pg_search 扩展未安装，跳过 BM25 索引（请切换到 paradedb/paradedb:latest-pg17 镜像）")
+        return
+
+    # 确认 content_tokenized 已填充
+    cursor.execute("SELECT COUNT(*) FROM wiki_documents WHERE content_tokenized = '';")
+    empty = cursor.fetchone()[0]
+    if empty > 0:
+        print(f"  ⚠ {empty:,} 行 content_tokenized 为空，请先运行 migrate_to_bm25.py，跳过 BM25 索引")
+        return
+
+    cursor.execute("SELECT 1 FROM pg_indexes WHERE indexname = 'idx_wiki_bm25';")
+    if cursor.fetchone():
+        print("  [跳过] idx_wiki_bm25 已存在")
+        return
+
+    cursor.execute("""
+        CREATE INDEX idx_wiki_bm25
+        ON wiki_documents
+        USING bm25 (id, content_tokenized)
+        WITH (
+            key_field = 'id',
+            text_fields = '{"content_tokenized": {"tokenizer": {"type": "whitespace"}}}'
+        );
+    """)
+    conn.commit()
+
+
 def main():
     args = parse_args()
 
@@ -206,22 +214,9 @@ def main():
     print(f"  量化: {args.quantize}")
     print(f"  维度: {args.dim}")
 
-    # 检查临时列是否还在
-    cursor.execute("""
-        SELECT column_name FROM information_schema.columns
-        WHERE table_name = 'wiki_documents' AND column_name = 'title_seg';
-    """)
-    has_seg_columns = cursor.fetchone() is not None
-
-    if has_seg_columns:
-        build_tsvector(cursor, conn)
-        drop_seg_columns(cursor, conn)
-    else:
-        print("\n临时分词列已清理，跳过 tsvector 构建")
-
     create_metadata_index(cursor, conn)
-    create_tsv_index(cursor, conn)
     create_vector_index(cursor, conn, args)
+    create_bm25_index(cursor, conn)
 
     print("\n[开始] ANALYZE wiki_documents（更新 planner 统计信息）...")
     t0 = time.time()

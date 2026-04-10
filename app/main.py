@@ -1,7 +1,9 @@
 import os
 import re
+import sys
 import time
 import asyncio
+import contextvars
 import numpy as np
 import asyncpg
 from concurrent.futures import ThreadPoolExecutor
@@ -22,28 +24,56 @@ DB_NAME = os.getenv("POSTGRES_DB", "rag_db")
 DB_USER = os.getenv("POSTGRES_USER", "rag_user")
 
 VECTOR_RECALL_K = 50   # 向量召回数
-BM25_RECALL_K = 10     # BM25 召回数
-HYBRID_TOP_K = 32      # 混合排序取前 N
-RERANK_TOP_K = 10      # 精排取前 N
+BM25_RECALL_K = 50     # BM25 召回数
+HYBRID_TOP_K = 50      # 混合排序取前 N
+RERANK_TOP_K = 10      # 精排最多取前 N（实际数量还受 RERANK_MIN_HYBRID_SCORE 约束）
+RERANK_MIN_HYBRID_SCORE = 0.010  # 低于此 RRF 分的文档跳过 rerank；约等于单路召回 top-40
 FINAL_TOP_K = 5        # MMR 最终返回数
 MMR_LAMBDA = 0.7       # MMR 多样性参数 (越大越相关，越小越多样)
 SCORE_THRESHOLD = 0.8  # rerank 分数阈值，<=0.8 判定为不相似
 
-VECTOR_TIMEOUT_S = 5.0   # 向量召回超时
-BM25_TIMEOUT_S = 5.0     # BM25 召回超时
-MMR_TIMEOUT_S = 100.0     # MMR 超时
+VECTOR_TIMEOUT_S = 5.0
+BM25_TIMEOUT_S = 5.0
+MMR_TIMEOUT_S = 100.0
 
 # ─── 全局模型 & 连接池 ────────────────────────────────────
-embedding_model = None
-reranker_model = None
+embedding_model: BGEM3FlagModel | None = None
+reranker_model: FlagReranker | None = None
 thread_pool = ThreadPoolExecutor(max_workers=8)
 db_pool: asyncpg.Pool | None = None
 
-# 缓存 embedding 列类型
 _embedding_col_type: str | None = None
 
-# 全局搜索信号量：同一时刻只处理 1 个搜索请求，其余排队
+# 请求并发控制
 _search_sem: asyncio.Semaphore | None = None
+
+# 模型调用串行锁（PyTorch 模型实例不支持多线程并发推理）
+_embed_lock: asyncio.Lock | None = None
+_rerank_lock: asyncio.Lock | None = None
+
+# ─── Per-request 日志缓冲 ─────────────────────────────────
+# create_task 和 run_in_executor 都会继承当前 context，
+# 所以子任务/线程写入的也是同一个 list，最终统一输出，避免并发请求日志交错。
+_log_buffer: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
+    "log_buffer", default=None
+)
+
+
+def _rlog(*args: object, sep: str = " ") -> None:
+    """向当前请求的日志缓冲追加一行；缓冲未设置时直接 print（启动日志等场景）。"""
+    msg = sep.join(str(a) for a in args)
+    buf = _log_buffer.get()
+    if buf is not None:
+        buf.append(msg)
+    else:
+        print(msg)
+
+
+def _flush_log(buf: list[str]) -> None:
+    """把缓冲内容原子写入 stdout，避免多请求行级交错。"""
+    if buf:
+        sys.stdout.write("\n".join(buf) + "\n")
+        sys.stdout.flush()
 
 
 def _get_device() -> str:
@@ -58,6 +88,8 @@ def _get_device() -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global embedding_model, reranker_model, db_pool, _embedding_col_type
+    global _search_sem, _embed_lock, _rerank_lock
+
     device = _get_device()
     print(f"推理设备: {device}")
     print("加载 embedding 模型...")
@@ -70,14 +102,12 @@ async def lifespan(app: FastAPI):
     print(f"  reranker device: {next(reranker_model.model.parameters()).device}")
     print("✅ 模型加载完成（常驻内存, FP16 推理）")
 
-    # 异步连接池
     db_pool = await asyncpg.create_pool(
         host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER,
         min_size=4, max_size=16,
     )
     print("✅ asyncpg 连接池就绪")
 
-    # 预缓存 embedding 列类型
     row = await db_pool.fetchrow("""
         SELECT udt_name FROM information_schema.columns
         WHERE table_name = 'wiki_documents' AND column_name = 'embedding';
@@ -85,13 +115,13 @@ async def lifespan(app: FastAPI):
     _embedding_col_type = row["udt_name"]
     print(f"Embedding 列类型: {_embedding_col_type}")
 
-    # 预热 jieba
     list(jieba.cut("预热分词"))
     print("✅ jieba 预热完成")
 
-    global _search_sem
     _search_sem = asyncio.Semaphore(4)
-    print("✅ 搜索队列就绪 (concurrency=4)")
+    _embed_lock = asyncio.Lock()
+    _rerank_lock = asyncio.Lock()
+    print("✅ 搜索队列就绪 (concurrency=4, embed/rerank 串行锁已就绪)")
 
     yield
 
@@ -130,11 +160,13 @@ def embed_query(query: str) -> list[float]:
 
 async def vector_recall(query_vec: list[float], k: int) -> tuple[list[dict], float]:
     """pgvector 向量召回（asyncpg 原生异步）"""
+    import json
     cast = f"::{_embedding_col_type}(1024)"
     vec_str = "[" + ",".join(str(v) for v in query_vec) + "]"
     t0 = time.time()
     async with db_pool.acquire() as conn:
         await conn.execute(f"SET statement_timeout = '{int(VECTOR_TIMEOUT_S * 1000)}ms'")
+        await conn.execute(f"SET hnsw.ef_search = {max(64, k)}")
         rows = await conn.fetch(
             f"""
             SELECT id, content, metadata,
@@ -146,15 +178,15 @@ async def vector_recall(query_vec: list[float], k: int) -> tuple[list[dict], flo
             vec_str, k,
         )
     elapsed = (time.time() - t0) * 1000
-    import json
-    results = [
+    return [
         {"id": r["id"], "content": r["content"],
          "metadata": json.loads(r["metadata"]) if isinstance(r["metadata"], str) else r["metadata"],
          "score": float(r["score"])}
         for r in rows
-    ]
-    return results, elapsed
+    ], elapsed
 
+
+# ─── BM25 ────────────────────────────────────────────────
 
 # 中文高频泛词停用词表，这类词选择性极低，放入 OR query 会命中大量无关行
 _BM25_STOPWORDS = {
@@ -168,21 +200,17 @@ _BM25_STOPWORDS = {
     "分析", "实现", "结果", "影响", "发展", "目前", "已经", "非常",
 }
 
-# OR 回退最多保留的词数；过多词会让命中行数爆炸
+# OR 回退最多保留的词数；pg_search 有 IDF，OR 查询不会再爆炸，但仍限制避免噪声
 _BM25_OR_MAX_TERMS = 4
-
-# OR 回退时，子查询候选上限；GIN 扫出来的行只取这么多再打分排序
-# 避免对全表命中行做 ts_rank + sort（O(n) 瓶颈）
-_BM25_OR_CANDIDATE_CAP = 500
 
 
 def _build_bm25_terms(query: str) -> list[str]:
-    """分词 → 清理特殊字符 → 去重 → 去停用词 → 返回去重后词列表"""
+    """分词 → 清理特殊字符 → 去重 → 去停用词"""
     raw = jieba.cut(query)
     seen: set[str] = set()
     terms: list[str] = []
     for t in raw:
-        t = re.sub(r"[&|!():'\\]", "", t).strip()
+        t = re.sub(r'[+\-&|!():{}\[\]^"~*?:\\]', "", t).strip()
         if len(t) < 2 or re.match(r'^[\s\W]+$', t):
             continue
         if t in seen or t in _BM25_STOPWORDS:
@@ -193,7 +221,9 @@ def _build_bm25_terms(query: str) -> list[str]:
 
 
 async def bm25_recall(query: str, k: int) -> tuple[list[dict], float]:
-    """BM25 召回（asyncpg 原生异步）"""
+    """真正的 BM25 召回（pg_search + Tantivy，有 IDF、TF 饱和、长度归一化）。
+    AND 查询优先（所有词必须出现），不足时回退到 OR（IDF 自然抑制高频词噪声）。
+    """
     import json
 
     terms = _build_bm25_terms(query)
@@ -204,19 +234,19 @@ async def bm25_recall(query: str, k: int) -> tuple[list[dict], float]:
     async with db_pool.acquire() as conn:
         await conn.execute(f"SET statement_timeout = '{int(BM25_TIMEOUT_S * 1000)}ms'")
 
-        # 先 AND，结果足够直接返回
+        # AND：所有词必须出现（pg_search 查询语法：+field:term）
         if len(terms) >= 2:
-            tsquery_and = " & ".join(terms)
+            and_query = " ".join(f"+content_tokenized:{t}" for t in terms)
             rows = await conn.fetch(
                 """
                 SELECT id, content, metadata,
-                       ts_rank(tsv, to_tsquery('simple', $1)) AS score
+                       paradedb.score(id) AS score
                 FROM wiki_documents
-                WHERE tsv @@ to_tsquery('simple', $1)
+                WHERE wiki_documents @@@ $1
                 ORDER BY score DESC
                 LIMIT $2;
                 """,
-                tsquery_and, k,
+                and_query, k,
             )
             if len(rows) >= k:
                 elapsed = (time.time() - t0) * 1000
@@ -227,26 +257,21 @@ async def bm25_recall(query: str, k: int) -> tuple[list[dict], float]:
                     for r in rows
                 ], elapsed
 
-        # OR 回退：按词长降序取最多 _BM25_OR_MAX_TERMS 个词（越长选择性越高）
+        # OR 回退：按词长降序取最多 _BM25_OR_MAX_TERMS 个词
+        # IDF 负责抑制高频词，不再需要候选上限 hack
         or_terms = sorted(terms, key=len, reverse=True)[:_BM25_OR_MAX_TERMS]
-        tsquery_or = " | ".join(or_terms)
-        print(f"  [bm25] AND 不足，OR fallback terms={or_terms}")
-        # 用子查询先 LIMIT 候选数，再在小集合上做 ts_rank + sort
-        # 避免对全表命中行做 O(n) 排序
+        or_query = " ".join(f"content_tokenized:{t}" for t in or_terms)
+        _rlog(f"  [bm25] AND 不足，OR fallback terms={or_terms}")
         rows = await conn.fetch(
             """
             SELECT id, content, metadata,
-                   ts_rank(tsv, to_tsquery('simple', $1)) AS score
-            FROM (
-                SELECT id, content, metadata, tsv
-                FROM wiki_documents
-                WHERE tsv @@ to_tsquery('simple', $1)
-                LIMIT $3
-            ) candidates
+                   paradedb.score(id) AS score
+            FROM wiki_documents
+            WHERE wiki_documents @@@ $1
             ORDER BY score DESC
             LIMIT $2;
             """,
-            tsquery_or, k, _BM25_OR_CANDIDATE_CAP,
+            or_query, k,
         )
 
     elapsed = (time.time() - t0) * 1000
@@ -281,11 +306,14 @@ def hybrid_merge(vector_results: list[dict], bm25_results: list[dict], k: int) -
 
 
 def rerank(query: str, docs: list[dict]) -> list[dict]:
-    """cross-encoder 精排（模型常驻内存，batch FP16 并行推理）"""
+    """Cross-encoder 精排（模型常驻内存，batch FP16 串行推理）。
+    调用方须持有 _rerank_lock，确保同时只有一个推理任务在跑。
+    """
     if not docs:
         return []
     pairs = [[query, doc["content"]] for doc in docs]
-    print(f"  [rerank] {len(pairs)} pairs, batch_size={reranker_model.batch_size}, "
+    _rlog(f"  [rerank] {len(pairs)} pairs, "
+          f"batch_size={reranker_model.batch_size}, "
           f"device={next(reranker_model.model.parameters()).device}, "
           f"fp16={reranker_model.use_fp16}")
     scores = reranker_model.compute_score(pairs, normalize=True)
@@ -301,7 +329,6 @@ async def mmr_select(query_vec: list[float], docs: list[dict], k: int, lam: floa
     if len(docs) <= k:
         return docs
 
-    # 批量拉取 embedding（异步）
     doc_ids = [doc["id"] for doc in docs]
     async with db_pool.acquire() as conn:
         await conn.execute(f"SET statement_timeout = '{int(MMR_TIMEOUT_S * 1000)}ms'")
@@ -320,28 +347,24 @@ async def mmr_select(query_vec: list[float], docs: list[dict], k: int, lam: floa
             vec = np.zeros(1024, dtype=np.float32)
         doc_vecs.append(vec)
 
-    query_np = np.array(query_vec, dtype=np.float32)
-    query_norm = query_np / (np.linalg.norm(query_np) + 1e-9)
     doc_norms = [v / (np.linalg.norm(v) + 1e-9) for v in doc_vecs]
 
-    selected = []
+    selected: list[int] = []
     candidates = list(range(len(docs)))
 
     for _ in range(k):
         best_idx = -1
         best_score = -float("inf")
-
         for i in candidates:
             relevance = docs[i]["score"]
-            if selected:
-                max_sim = max(float(np.dot(doc_norms[i], doc_norms[j])) for j in selected)
-            else:
-                max_sim = 0.0
+            max_sim = max(
+                (float(np.dot(doc_norms[i], doc_norms[j])) for j in selected),
+                default=0.0,
+            )
             mmr_score = lam * relevance - (1 - lam) * max_sim
             if mmr_score > best_score:
                 best_score = mmr_score
                 best_idx = i
-
         if best_idx == -1:
             break
         selected.append(best_idx)
@@ -356,13 +379,13 @@ def _trunc(text: str, max_len: int = 10) -> str:
     return text[:max_len] + "..." if len(text) > max_len else text
 
 
-def _log_docs(label: str, docs: list[dict], top_n: int = 3):
-    print(f"  [{label}] 共 {len(docs)} 条, top {min(top_n, len(docs))}:")
+def _log_docs(label: str, docs: list[dict], top_n: int = 3) -> None:
+    _rlog(f"  [{label}] 共 {len(docs)} 条, top {min(top_n, len(docs))}:")
     for doc in docs[:top_n]:
         meta = doc.get("metadata", {})
         title = _trunc(str(meta.get("title", "")))
         content = _trunc(doc.get("content", ""))
-        print(f"    id={doc['id']} score={doc['score']:.4f} title={title} content={content}")
+        _rlog(f"    id={doc['id']} score={doc['score']:.4f} title={title} content={content}")
 
 
 # ─── API 路由 ────────────────────────────────────────────
@@ -377,68 +400,89 @@ async def _do_search(req: QueryRequest):
     query = req.query
     top_k = req.top_k
     loop = asyncio.get_event_loop()
-    print(f"\n{'='*60}")
-    print(f"Query: {query}")
 
-    # 1. Query Embedding（线程池，避免阻塞事件循环）
-    t0 = time.time()
-    query_vec = await loop.run_in_executor(thread_pool, embed_query, query)
-    t_embed = (time.time() - t0) * 1000
-    print(f"[1] Embedding: {t_embed:.1f}ms  vec[:10]={[round(v, 4) for v in query_vec[:10]]}")
+    # 初始化 per-request 日志缓冲，子任务和 executor 线程通过 ContextVar 继承
+    buf: list[str] = []
+    token = _log_buffer.set(buf)
 
-    # 2. 多路召回（并发，任一超时/异常则取消它，用已完成的继续）
-    t0 = time.time()
-    vec_task = asyncio.create_task(vector_recall(query_vec, VECTOR_RECALL_K))
-    bm25_task = asyncio.create_task(bm25_recall(query, BM25_RECALL_K))
+    try:
+        _rlog(f"\n{'='*60}")
+        _rlog(f"Query: {query}")
 
-    done, pending = await asyncio.wait(
-        [vec_task, bm25_task], return_when=asyncio.FIRST_EXCEPTION,
-    )
-    if pending:
-        _, still_pending = await asyncio.wait(pending, timeout=0.5)
-        for t in still_pending:
-            t.cancel()
+        # 1. Query Embedding（持锁串行，避免模型并发）
+        t0 = time.time()
+        async with _embed_lock:
+            query_vec = await loop.run_in_executor(thread_pool, embed_query, query)
+        t_embed = (time.time() - t0) * 1000
+        _rlog(f"[1] Embedding: {t_embed:.1f}ms  vec[:5]={[round(v, 4) for v in query_vec[:5]]}")
 
-    vec_results, t_vec = ([], 0.0)
-    bm25_results, t_bm25 = ([], 0.0)
-    if vec_task.done() and not vec_task.cancelled() and vec_task.exception() is None:
-        vec_results, t_vec = vec_task.result()
-    if bm25_task.done() and not bm25_task.cancelled() and bm25_task.exception() is None:
-        bm25_results, t_bm25 = bm25_task.result()
+        # 2. 多路召回（并发，任一超时/异常则取消，用已完成的继续）
+        t0 = time.time()
+        vec_task = asyncio.create_task(vector_recall(query_vec, VECTOR_RECALL_K))
+        bm25_task = asyncio.create_task(bm25_recall(query, BM25_RECALL_K))
 
-    t_recall = (time.time() - t0) * 1000
-    print(f"[2] Parallel recall: {t_recall:.1f}ms (wall) | vector={t_vec:.1f}ms({len(vec_results)}条) | bm25={t_bm25:.1f}ms({len(bm25_results)}条)")
-    if not vec_results and vec_task.done() and vec_task.exception():
-        print(f"  ⚠ vector recall 超时/异常: {vec_task.exception()}")
-    if not bm25_results and bm25_task.done() and bm25_task.exception():
-        print(f"  ⚠ bm25 recall 超时/异常: {bm25_task.exception()}")
-    _log_docs("vector", vec_results)
-    _log_docs("bm25", bm25_results)
+        done, pending = await asyncio.wait(
+            [vec_task, bm25_task], return_when=asyncio.FIRST_EXCEPTION,
+        )
+        if pending:
+            _, still_pending = await asyncio.wait(pending, timeout=0.5)
+            for t in still_pending:
+                t.cancel()
 
-    # 3. 并集 + RRF 混合排分 → top 50
-    t0 = time.time()
-    merged = hybrid_merge(vec_results, bm25_results, HYBRID_TOP_K)
-    t_merge = (time.time() - t0) * 1000
-    print(f"[3] Hybrid merge: {t_merge:.1f}ms")
-    _log_docs("merged", merged)
+        vec_results, t_vec = [], 0.0
+        bm25_results, t_bm25 = [], 0.0
+        if vec_task.done() and not vec_task.cancelled() and vec_task.exception() is None:
+            vec_results, t_vec = vec_task.result()
+        if bm25_task.done() and not bm25_task.cancelled() and bm25_task.exception() is None:
+            bm25_results, t_bm25 = bm25_task.result()
 
-    # 4. Cross-encoder 精排 → top 15（线程池，GPU 密集）
-    t0 = time.time()
-    reranked = await loop.run_in_executor(thread_pool, rerank, query, merged)
-    t_rerank = (time.time() - t0) * 1000
-    print(f"[4] Rerank: {t_rerank:.1f}ms")
-    _log_docs("reranked", reranked)
+        t_recall = (time.time() - t0) * 1000
+        _rlog(f"[2] Parallel recall: {t_recall:.1f}ms (wall) | "
+              f"vector={t_vec:.1f}ms({len(vec_results)}条) | "
+              f"bm25={t_bm25:.1f}ms({len(bm25_results)}条)")
+        if not vec_results and vec_task.done() and vec_task.exception():
+            _rlog(f"  ⚠ vector recall 超时/异常: {vec_task.exception()}")
+        if not bm25_results and bm25_task.done() and bm25_task.exception():
+            _rlog(f"  ⚠ bm25 recall 超时/异常: {bm25_task.exception()}")
+        _log_docs("vector", vec_results)
+        _log_docs("bm25", bm25_results)
 
-    # 5. MMR 去重 → top K
-    t0 = time.time()
-    final = await mmr_select(query_vec, reranked, top_k, MMR_LAMBDA)
-    t_mmr = (time.time() - t0) * 1000
-    print(f"[5] MMR: {t_mmr:.1f}ms")
-    _log_docs("final", final)
+        # 3. RRF 混合排分
+        t0 = time.time()
+        merged = hybrid_merge(vec_results, bm25_results, HYBRID_TOP_K)
+        t_merge = (time.time() - t0) * 1000
+        _rlog(f"[3] Hybrid merge: {t_merge:.1f}ms")
+        _log_docs("merged", merged)
 
-    t_total = t_embed + t_recall + t_merge + t_rerank + t_mmr
-    print(f"[Total] {t_total:.1f}ms")
-    print(f"{'='*60}\n")
+        # 4. Cross-encoder 精排（持锁串行 + 按分数阈值动态裁剪候选数）
+        to_rerank = [d for d in merged if d["score"] >= RERANK_MIN_HYBRID_SCORE]
+        if not to_rerank:
+            # 全部低于阈值时兜底取 top-1，保证流水线不断
+            to_rerank = merged[:1]
+        _rlog(f"  [rerank] 送入 {len(to_rerank)}/{len(merged)} 条（score >= {RERANK_MIN_HYBRID_SCORE}）")
+
+        t0 = time.time()
+        async with _rerank_lock:
+            reranked = await loop.run_in_executor(thread_pool, rerank, query, to_rerank)
+        t_rerank = (time.time() - t0) * 1000
+        _rlog(f"[4] Rerank: {t_rerank:.1f}ms")
+        _log_docs("reranked", reranked)
+
+        # 5. MMR 去重
+        t0 = time.time()
+        final = await mmr_select(query_vec, reranked, top_k, MMR_LAMBDA)
+        t_mmr = (time.time() - t0) * 1000
+        _rlog(f"[5] MMR: {t_mmr:.1f}ms")
+        _log_docs("final", final)
+
+        t_total = t_embed + t_recall + t_merge + t_rerank + t_mmr
+        _rlog(f"[Total] {t_total:.1f}ms")
+        _rlog(f"{'='*60}")
+
+    finally:
+        # 无论成功或异常，都原子输出本次请求的全部日志
+        _log_buffer.reset(token)
+        _flush_log(buf)
 
     # 格式化输出（过滤低分结果）
     results = []

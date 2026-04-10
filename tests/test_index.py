@@ -24,14 +24,14 @@ def test_embedding_index_exists(cursor):
     )
 
 
-def test_tsv_gin_index_exists(cursor):
-    """tsv 全文检索 GIN 索引是否存在"""
+def test_bm25_index_exists(cursor):
+    """pg_search BM25 索引是否存在"""
     cursor.execute("""
         SELECT indexname FROM pg_indexes
         WHERE tablename = 'wiki_documents'
-          AND indexname = 'idx_wiki_documents_tsv';
+          AND indexname = 'idx_wiki_bm25';
     """)
-    assert cursor.fetchone() is not None, "tsv GIN 索引不存在"
+    assert cursor.fetchone() is not None, "BM25 索引不存在，请运行 migrate_to_bm25.py 后再执行 build_index.py"
 
 
 def test_primary_key_exists(cursor):
