@@ -108,21 +108,11 @@ BGE-Reranker-v2-M3 参数量约 560M，推理较重。可替换方案：
 
 对于中文维基问答场景，`bge-reranker-base` 的精度损失通常在可接受范围内，但 rerank 耗时可减半。
 
-### 方向 C：INT8 量化推理
+### 方向 C：量化推理
 
-当前用 FP16，对 MPS/CUDA 均支持 INT8 量化：
-
-```python
-# FlagReranker 支持 quantization 参数
-reranker_model = FlagReranker(
-    RERANKER_MODEL_PATH,
-    use_fp16=True,
-    # 或者：
-    # quantization="int8"  # 需要 bitsandbytes
-)
-```
-
-INT8 在保持精度的前提下，推理内存减半，速度提升约 1.5~2×（GPU 效果更显著，MPS 上收益视 Apple Silicon 型号而定）。
+> **注意（Apple Silicon 用户）**：`bitsandbytes` INT8 量化**不支持 MPS 后端**，在 Mac 上运行会强制 fallback 到 CPU，反而更慢。M4 Pro 的 GPU 对 FP16 已有原生加速，直接量化 PyTorch 模型在 MPS 上几乎没有收益。
+>
+> 在 Apple Silicon 上可行的量化路径是 **CoreML + ONNX Runtime**，在导出阶段完成 INT8/FP16 权重压缩，由 ANE 执行（见方向 A）。
 
 ### 方向 D：请求合并批处理（高并发场景）
 
@@ -162,3 +152,109 @@ def rerank_cached(query: str, doc_ids_tuple: tuple) -> list[float]:
 | ☆ | E：结果缓存 | 中等 | 仅重复查询有效 |
 
 **最快的起手式**：先降 `HYBRID_TOP_K` 到 16，同时换 `bge-reranker-base` 跑一轮对比测试，预计单并发 p50 可从 4.5s 降到 2s 以内。
+
+---
+
+## 4月10日 推理层重构实验
+
+### 变更摘要
+
+| 变更项 | 改动前 | 改动后 |
+|--------|--------|--------|
+| Embedding 推理 | `BGEM3FlagModel.encode()` 封装 | 直接调用底层 `AutoModel`（XLM-RoBERTa）+ tokenizer |
+| Reranker 推理 | `FlagReranker.compute_score()` 封装 | 直接调用底层 `AutoModelForSequenceClassification` + tokenizer |
+| Reranker content 截断 | 无（全文送入，tokenizer 自动截断至 512 token） | 显式截断至 **300 字符**后再 tokenize |
+| MPS kernel 预热 | 无 | lifespan 内用 4 种 seq_len（32/128/256/512）预跑 embed+rerank |
+| `HYBRID_TOP_K` | 50 | **30**（用户根据 recall_rank_analysis 调整） |
+| 各阶段 timeout | 5s / 5s / 100s | **1s / 1s / 1s** |
+
+### 单条查询实测数据（Query: "伪造川普视频"）
+
+| 阶段 | 耗时 | 说明 |
+|------|------|------|
+| Embedding | **361 ms** | MPS cold start；预热后预期降至 ~60 ms |
+| 向量召回 | 29 ms | 50条 |
+| BM25 召回 | 45 ms | 50条（OR fallback） |
+| Hybrid merge | 0 ms | RRF 纯 CPU |
+| Rerank | **3125 ms** | 50 对，全文未截断时 padding 到 512 token |
+| MMR | 19 ms | |
+| **总计** | **3553 ms** | |
+
+### content 截断对 Rerank 耗时的理论影响
+
+Cross-encoder attention 复杂度为 O(L²)。中文字符约 1字≈1 token：
+
+| content 截断长度 | 有效序列长度（估算） | 相对于 512 的算力比 | 预期耗时（50对） |
+|-----------------|-------------------|-------------------|----------------|
+| 无截断（当前实测） | ~512 token | 100% | ~3125 ms |
+| 300 字 | ~320 token | 39% | ~1220 ms |
+| 200 字 | ~220 token | 18% | ~560 ms |
+| 150 字 | ~170 token | 11% | ~340 ms |
+
+实际收益还取决于 batch 内最长文档的长度（padding 机制）。
+
+### 主要结论
+
+1. **Embedding 361ms 的根因是 MPS shader cold start**，而非模型本身慢。预热脚本在 lifespan 内以 4 种长度分别跑一次 forward，可消除首次请求的编译延迟。
+
+2. **Rerank 是绝对瓶颈**：50 对 × ~512 token padding = 3.1s，占端到端 88%。截断 content 至 300 字后预期降至 ~1.2s；再将 `HYBRID_TOP_K` 降至 30 后送入 rerank 的候选数也随之减少。
+
+3. **直接调用底层模型与封装方法在速度上无差异**（Python 线程共享内存，无跨线程拷贝），主要收益是推理过程透明可控（可自定义截断、精度、batch 策略）。
+
+---
+
+## 4月10日 PyTorch FP16 (MPS) vs ONNX (CPU EP) 推理基准测试
+
+### 测试环境
+
+| 项目 | 值 |
+|------|-----|
+| 硬件 | MBP M4 Pro |
+| PyTorch 后端 | MPS (Metal GPU)，FP16 |
+| ONNX 后端 | CPU EP（CoreML EP 因 FP32 模型触发 SystemError:20 自动回退） |
+| 模型格式 | ONNX FP32（`model.onnx`，optimum 导出） |
+| Reranker 输入 | **全文 content**（未截断，tokenizer 自动截断至 512 token） |
+| 测试方法 | 严格串行：PyTorch 全部完成 → 释放 GPU 显存 → 加载 ONNX |
+| N_WARMUP / N_RUNS | 5 / 30 |
+
+> **注**：CoreML EP 对 FP32 ONNX 模型触发 `SystemError: 20`（ANE 仅支持量化模型，Metal GPU 通路也不兼容当前图结构），自动回退至 CPU EP。下表 ONNX 列实为 CPU 单线程推理，并非 GPU 加速路径。
+
+### Embedding（batch=1）
+
+| 阶段 | PyTorch FP16 MPS | ONNX CPU EP | 对比 |
+|------|-----------------|-------------|------|
+| tokenize | 0.1 ms | 0.1 ms | 持平 |
+| device transfer | 0.3 ms | 0.0 ms | — |
+| **forward** | **8.3 ms** | **17.4 ms** | PyTorch 快 **2.1×** |
+| postprocess | 0.3 ms | 0.0 ms | — |
+| **total** | **9.1 ms** | **17.5 ms** | PyTorch 快 **1.9×** |
+
+### Reranker（各 batch size，全文 content，tokenizer 截断至 512 token）
+
+| batch | PyTorch FP16 MPS (total) | ONNX CPU EP (total) | 对比 |
+|-------|--------------------------|---------------------|------|
+| 5 | 38.4 ms | 128.4 ms | PyTorch 快 **3.3×** |
+| 10 | 66.1 ms | 253.6 ms | PyTorch 快 **3.8×** |
+| 20 | 119.0 ms | 588.5 ms | PyTorch 快 **5.0×** |
+| 30 | 176.7 ms | 833.2 ms | PyTorch 快 **4.7×** |
+
+Reranker forward 单独对比（去除 tokenize/transfer 开销）：
+
+| batch | PyTorch forward | ONNX forward | 对比 |
+|-------|----------------|--------------|------|
+| 5 | 36.9 ms | 127.9 ms | PyTorch 快 **3.5×** |
+| 10 | 64.9 ms | 252.9 ms | PyTorch 快 **3.9×** |
+| 20 | 117.7 ms | 587.5 ms | PyTorch 快 **5.0×** |
+| 30 | 175.3 ms | 831.7 ms | PyTorch 快 **4.7×** |
+
+> 注：测试文档为约 30~80 字的中文短句，全文送入 tokenizer 后序列长度较短（远低于 512），实际 batch padding 长度偏低。生产场景下 content 更长（向 512 token 逼近），reranker 耗时会显著更高，两者差距也可能进一步拉大。
+
+### 结论
+
+1. **PyTorch FP16 (MPS) 全面碾压 ONNX CPU EP**：forward 阶段快 2~5×，这是 Metal GPU vs CPU 单线程的硬件差距，与 ONNX 格式本身无关。
+
+2. **CoreML EP 无法使用的根因**：导出的 ONNX 模型为 FP32，CoreML EP 在 `CPUAndGPU` 模式下尝试将部分算子调度到 Metal GPU 时失败（`SystemError: 20`）。正确路径是先完成 FP16 转换（`convert_onnx_fp16.py`），再测试 CoreML EP。
+
+3. **当前最优方案仍是 PyTorch FP16 (MPS)**：预热后 embed ~9ms、rerank(30) ~177ms，已是当前硬件的实际极限。
+
+4. **下一步**：运行 `scripts/convert_onnx_fp16.py` 生成 `model_fp16.onnx`，重测 CoreML EP 路径，预期 CoreML FP16 forward 可接近甚至超越 PyTorch MPS。
