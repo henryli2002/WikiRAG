@@ -18,7 +18,7 @@ eval/generate_answers.py
   chunk_id            ground truth chunk（用于与 eval_results.csv 对照）
   query               实际使用的问题文本
   adversarial_type    对抗类型（""=正常样本）
-  hit_at_5            检索是否命中（来自 eval_results.csv，方便分层分析）
+  hit_at_5            检索是否命中（直接由本次 pipeline 结果计算，无需外部文件）
   retrieved_chunk_ids 实际召回的 chunk id（JSON 数组）
   retrieved_context   送入 LLM 的完整 Context 文本
   generated_answer    Qwen 9B 生成的答案
@@ -26,6 +26,7 @@ eval/generate_answers.py
 用法：
   python eval/generate_answers.py
   python eval/generate_answers.py --golden eval/golden_dataset.csv --limit 20
+  python eval/generate_answers.py --resume   # 读取已有输出，只补跑失败条目
 """
 
 from __future__ import annotations
@@ -78,18 +79,9 @@ _USER_TEMPLATE = """\
 
 # ─── 工具函数 ─────────────────────────────────────────────────────────
 
-def _load_hit_map(eval_results_path: str) -> dict[int, bool]:
-    """从 eval_results.csv 读取每条 query 的 Hit@5 结果，供生成阶段分层分析。"""
-    if not os.path.exists(eval_results_path):
-        return {}
-    hit_map: dict[int, bool] = {}
-    with open(eval_results_path, encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            try:
-                hit_map[int(row["query_id"])] = str(row["hit_at_5"]).lower() not in ("false", "0")
-            except (KeyError, ValueError):
-                pass
-    return hit_map
+def _hit_at_k(final_docs: list[dict], chunk_id: int, k: int) -> bool:
+    """检查目标 chunk 是否出现在 final 结果的前 k 位。"""
+    return any(doc["id"] == chunk_id for doc in final_docs[:k])
 
 
 def _format_context(docs: list[dict], max_chars_per_doc: int = 400) -> tuple[str, list[int]]:
@@ -139,13 +131,12 @@ def generate_answer(llm: OpenAI, query: str, context: str) -> tuple[str, GenStat
     parts:list[str] = []
     usage    = None
 
-    stream = llm.chat.completions.create(
+    stream = llm.chat.completions.create(  # type: ignore[call-overload]
         model=LLAMACPP_MODEL,
         messages=messages,
         stream=True,
         temperature=0.1,
         top_p=0.7,
-        max_tokens=256,
         extra_body=extra,
     )
     for chunk in stream:
@@ -171,6 +162,29 @@ def generate_answer(llm: OpenAI, query: str, context: str) -> tuple[str, GenStat
 
 # ─── 主流程 ──────────────────────────────────────────────────────────
 
+def _load_existing(path: str) -> tuple[dict[int, dict], list[str]]:
+    """
+    读取已有的 eval_answers.csv。
+    返回 (rows_by_qid, fieldnames)。
+    rows_by_qid: query_id -> row dict（保留原始字符串，原样回写）
+    """
+    if not os.path.exists(path):
+        return {}, []
+    with open(path, encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+        fieldnames = reader.fieldnames or []
+    return {int(r["query_id"]): r for r in rows}, list(fieldnames)
+
+
+def _is_failed(row: dict) -> bool:
+    """判断某条已有结果是否属于生成失败（需要重跑）。"""
+    try:
+        return float(row.get("gen_ms", -1)) < 0 or row.get("generated_answer", "").strip() == ""
+    except (ValueError, TypeError):
+        return True
+
+
 async def run(args):
     # ── 读取黄金测试集 ────────────────────────────────────────────────
     if not os.path.exists(args.golden):
@@ -187,8 +201,28 @@ async def run(args):
     if args.limit:
         golden = golden[: args.limit]
 
-    hit_map = _load_hit_map(args.eval_results)
-    print(f"[generate_answers] {len(golden)} 条查询，Hit@5 已知 {len(hit_map)} 条")
+    # ── Resume 模式：只跑失败条目 ────────────────────────────────────
+    existing_rows: dict[int, dict] = {}
+    existing_fieldnames: list[str] = []
+
+    if args.resume:
+        existing_rows, existing_fieldnames = _load_existing(args.output)
+        if not existing_rows:
+            print(f"⚠ --resume 指定但未找到 {args.output}，将全量运行", file=sys.stderr)
+        else:
+            all_qids     = {int(g["query_id"]) for g in golden}
+            failed_qids  = {qid for qid, r in existing_rows.items() if _is_failed(r)}
+            missing_qids = all_qids - set(existing_rows.keys())
+            retry_qids   = failed_qids | missing_qids
+            golden = [g for g in golden if int(g["query_id"]) in retry_qids]
+            print(f"[generate_answers] resume 模式：已有 {len(existing_rows)} 条，"
+                  f"失败 {len(failed_qids)} 条，未处理 {len(missing_qids)} 条，"
+                  f"本次补跑 {len(golden)} 条")
+            if not golden:
+                print("✅ 所有条目已完成，无需补跑")
+                return
+    else:
+        print(f"[generate_answers] {len(golden)} 条查询")
 
     # ── 初始化 RetrievalCore ──────────────────────────────────────────
     core = RetrievalCore(verbose=False)
@@ -208,25 +242,29 @@ async def run(args):
             chunk_id = int(g["chunk_id"])
             query    = g["_query"]
             adv_type = g.get("adversarial_type", "").strip()
-            hit5     = hit_map.get(query_id)
 
             print(f"  [{i:3d}/{len(golden)}] qid={query_id:3d}  q={query[:45]}")
 
             # 检索
             pr = await core.run_pipeline(query)
+            t  = pr.timings
             context, chunk_ids = _format_context(pr.final)
+            hit5 = _hit_at_k(pr.final, chunk_id, 5)
 
             # 生成
             try:
                 answer, stats = generate_answer(llm, query, context)
+                e2e_ms = round(t.total_ms + stats.gen_ms, 1)
                 print(f"           → {answer[:50]}...  "
-                      f"ttft={stats.ttft_ms:.0f}ms  gen={stats.gen_ms:.0f}ms  "
+                      f"ret={t.total_ms:.0f}ms  ttft={stats.ttft_ms:.0f}ms  "
+                      f"gen={stats.gen_ms:.0f}ms  e2e={e2e_ms:.0f}ms  "
                       f"tok={stats.prompt_tokens}+{stats.completion_tokens}")
             except Exception as e:
                 print(f"           ⚠ 生成失败: {e}")
                 answer = ""
                 stats  = GenStats(ttft_ms=-1, gen_ms=-1, prompt_tokens=-1,
                                   completion_tokens=-1, total_tokens=-1)
+                e2e_ms = -1
                 failed += 1
 
             rows.append({
@@ -234,14 +272,23 @@ async def run(args):
                 "chunk_id":            chunk_id,
                 "query":               query,
                 "adversarial_type":    adv_type,
-                "hit_at_5":            "" if hit5 is None else str(hit5),
+                "hit_at_5":            str(hit5),
                 "n_chunks":            len(chunk_ids),
                 "context_chars":       len(context),
                 "retrieved_chunk_ids": json.dumps(chunk_ids, ensure_ascii=False),
                 "retrieved_context":   context,
                 "generated_answer":    answer,
+                # ── 检索各阶段延迟（来自 pr.timings） ──
+                "embed_ms":            round(t.embed_ms,  1),
+                "vector_ms":           round(t.vector_ms, 1),
+                "bm25_ms":             round(t.bm25_ms,   1),
+                "rerank_ms":           round(t.rerank_ms, 1),
+                "mmr_ms":              round(t.mmr_ms,    1),
+                "retrieval_ms":        round(t.total_ms,  1),
+                # ── 生成延迟 ──
                 "ttft_ms":             stats.ttft_ms,
                 "gen_ms":              stats.gen_ms,
+                "e2e_ms":              e2e_ms,
                 "prompt_tokens":       stats.prompt_tokens,
                 "completion_tokens":   stats.completion_tokens,
                 "total_tokens":        stats.total_tokens,
@@ -250,51 +297,94 @@ async def run(args):
     finally:
         await core.close()
 
-    # ── 写 CSV ────────────────────────────────────────────────────────
+    # ── 写 CSV（resume 模式下合并新旧结果） ──────────────────────────
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
-    with open(args.output, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
+
+    if args.resume and existing_rows:
+        # 用本次结果覆盖对应 query_id 的旧行，其余保留
+        new_by_qid = {r["query_id"]: r for r in rows}
+        existing_rows.update(new_by_qid)
+        # 按 query_id 排序还原原始顺序
+        merged = [existing_rows[qid] for qid in sorted(existing_rows)]
+        fieldnames = existing_fieldnames or list(rows[0].keys())
+        with open(args.output, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(merged)
+        print(f"\n✅ resume 完成：{len(rows)} 条补跑，合并后共 {len(merged)} 条 → {args.output}")
+        # 汇总统计基于合并后全量数据
+        rows = merged
+    else:
+        with open(args.output, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
 
     # ── 生成延迟与 Token 汇总 ─────────────────────────────────────────
-    valid = [r for r in rows if r["gen_ms"] >= 0]
+    def _flt(r: dict, key: str) -> float:
+        try:
+            return float(r.get(key, -1))
+        except (ValueError, TypeError):
+            return -1.0
+
+    valid = [r for r in rows if _flt(r, "gen_ms") >= 0]
 
     def _pct(vals, p):
         s = sorted(vals)
         return round(s[min(int(len(s) * p), len(s) - 1)], 1) if s else 0.0
 
-    ttft_vals    = [r["ttft_ms"]           for r in valid if r["ttft_ms"] >= 0]
-    gen_ms_vals  = [r["gen_ms"]           for r in valid]
-    ptok_vals    = [r["prompt_tokens"]     for r in valid if r["prompt_tokens"] >= 0]
-    ctok_vals    = [r["completion_tokens"] for r in valid if r["completion_tokens"] >= 0]
-    nchunk_vals  = [r["n_chunks"]          for r in valid]
-    chars_vals   = [r["context_chars"]     for r in valid]
+    def _v(key):
+        return [_flt(r, key) for r in valid if _flt(r, key) >= 0]
 
     print(f"\n✅ {len(rows)} 条写入 {args.output}，生成失败 {failed} 条")
     print()
-    print("  ── 生成延迟（Qwen 9B，不含 Gemini judge）──────────────────")
-    if ttft_vals:
-        print(f"  ttft_ms  P50={_pct(ttft_vals,.50):>8}  "
-              f"P90={_pct(ttft_vals,.90):>8}  P99={_pct(ttft_vals,.99):>8}")
-    print(f"  gen_ms   P50={_pct(gen_ms_vals,.50):>8}  "
-          f"P90={_pct(gen_ms_vals,.90):>8}  P99={_pct(gen_ms_vals,.99):>8}")
+    print("  ── 检索各阶段延迟 ─────────────────────────────────────────")
+    for label, key in [
+        ("embed",     "embed_ms"),
+        ("vector",    "vector_ms"),
+        ("bm25",      "bm25_ms"),
+        ("rerank",    "rerank_ms"),
+        ("mmr",       "mmr_ms"),
+        ("retrieval", "retrieval_ms"),
+    ]:
+        vals = _v(key)
+        if vals:
+            print(f"  {label:<10} P50={_pct(vals,.50):>8}  "
+                  f"P90={_pct(vals,.90):>8}  P99={_pct(vals,.99):>8}")
+    print()
+    print("  ── 生成延迟 + 端到端 ──────────────────────────────────────")
+    for label, key in [
+        ("ttft",      "ttft_ms"),
+        ("gen",       "gen_ms"),
+        ("e2e",       "e2e_ms"),
+    ]:
+        vals = _v(key)
+        if vals:
+            print(f"  {label:<10} P50={_pct(vals,.50):>8}  "
+                  f"P90={_pct(vals,.90):>8}  P99={_pct(vals,.99):>8}")
+    print()
+    ptok_vals   = _v("prompt_tokens")
+    ctok_vals   = _v("completion_tokens")
+    nchunk_vals = _v("n_chunks")
+    chars_vals  = _v("context_chars")
     if ptok_vals:
-        print(f"  prompt   P50={_pct(ptok_vals,.50):>8.0f} tok  "
+        print(f"  prompt     P50={_pct(ptok_vals,.50):>8.0f} tok  "
               f"P90={_pct(ptok_vals,.90):>8.0f} tok")
     if ctok_vals:
-        print(f"  complete P50={_pct(ctok_vals,.50):>8.0f} tok  "
+        print(f"  complete   P50={_pct(ctok_vals,.50):>8.0f} tok  "
               f"P90={_pct(ctok_vals,.90):>8.0f} tok")
-    print(f"  n_chunks P50={_pct(nchunk_vals,.50):>8.0f}      "
-          f"context_chars P50={_pct(chars_vals,.50):>8.0f}")
+    if nchunk_vals:
+        print(f"  n_chunks   P50={_pct(nchunk_vals,.50):>8.0f}      "
+              f"context_chars P50={_pct(chars_vals,.50):>8.0f}")
     print()
     print("  ── FINAL_TOP_K 调参参考 ───────────────────────────────────")
     by_n: dict[int, list] = {}
     for r in valid:
-        by_n.setdefault(r["n_chunks"], []).append(r)
+        n_chunks = int(_flt(r, "n_chunks"))
+        by_n.setdefault(n_chunks, []).append(r)
     for n in sorted(by_n):
-        g = [r["gen_ms"] for r in by_n[n]]
-        p = [r["prompt_tokens"] for r in by_n[n] if r["prompt_tokens"] >= 0]
+        g = [_flt(r, "gen_ms") for r in by_n[n]]
+        p = [_flt(r, "prompt_tokens") for r in by_n[n] if _flt(r, "prompt_tokens") >= 0]
         print(f"  n_chunks={n}: gen_ms P50={_pct(g,.50):>7}  "
               f"prompt_tok P50={_pct(p,.50):>6.0f}  (n={len(g)}条)")
     print()
@@ -303,11 +393,11 @@ async def run(args):
 
 def main():
     parser = argparse.ArgumentParser(description="检索 + 生成答案（阶段二 Step 1）")
-    parser.add_argument("--golden",       default="eval/golden_dataset.csv")
-    parser.add_argument("--eval-results", default="eval/eval_results.csv",
-                        help="run_retrieval_eval.py 的输出，用于导入 Hit@5 标记")
-    parser.add_argument("--output",       default="eval/eval_answers.csv")
-    parser.add_argument("--limit",        type=int, default=None,
+    parser.add_argument("--golden",  default="eval/golden_dataset.csv")
+    parser.add_argument("--output",  default="eval/eval_answers.csv")
+    parser.add_argument("--resume",  action="store_true",
+                        help="读取已有 output，只补跑 gen_ms<0 或 answer 为空的失败条目")
+    parser.add_argument("--limit",   type=int, default=None,
                         help="只处理前 N 条（调试用）")
     args = parser.parse_args()
     asyncio.run(run(args))

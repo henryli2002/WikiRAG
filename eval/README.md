@@ -223,32 +223,34 @@ python eval/generate_answers.py
 python eval/judge_answers.py
 ```
 
-**评分维度（0–3 整数，归一化到 0–1）**
+**评分方法（工业级原子分解，0–1 浮点）**
 
-| 维度 | 测量什么 | 3 分标准 |
-|------|---------|---------|
-| **Faithfulness** | 答案是否完全源于 Context，有无幻觉 | 每句话都能在 Context 中找到直接依据 |
-| **Answer Relevance** | 答案是否真正回答了问题 | 准确、完整，信息密度高 |
+| 维度 | 方法 | 分值 |
+|------|------|------|
+| **Faithfulness** | 将答案拆解为原子声明（每个事实点 1 条），对照 Context 逐条 YES/NO 验证；分数 = 支持声明数 / 总声明数 | 0–1，越高越少幻觉 |
+| **Answer Relevance** | 基于答案反向生成 3 个候选问题，每题与原始 query 相似度打 0–2 分；分数 = 平均相似度 / 2 | 0–1，越高越切题 |
+
+每条答案对 Gemini 发出 **3 次 API 调用**：① 原子分解、② 批量验证（单次调用验证所有声明）、③ 反向生成 + 相似度打分。
 
 **输出：`eval_judge_results.csv`**
 
 | 列 | 含义 |
 |----|------|
-| `faithfulness_score` | 0–3 原始分 |
-| `faithfulness_norm` | 0–1 归一化分 |
-| `faithfulness_reason` | Gemini 的扣分/加分说明（人工抽检的核心依据） |
-| `answer_relevance_score` | 0–3 原始分 |
-| `answer_relevance_norm` | 0–1 归一化分 |
-| `answer_relevance_reason` | 同上 |
+| `faithfulness_score` | 0–1 浮点（supported / total） |
+| `faithfulness_claims_total` | 原子声明总数 |
+| `faithfulness_claims_supported` | 被 Context 支持的声明数 |
+| `faithfulness_details` | JSON，每条声明的 YES/NO 结果（人工抽检的核心依据） |
+| `answer_relevance_score` | 0–1 浮点（avg sim / 2） |
+| `answer_relevance_questions` | JSON，Gemini 生成的 3 个候选问题 + 相似度评分 |
 | `overall_norm` | 两维度均值 |
 
 **如何分析这个文件**
 
-**最重要的操作：人工抽检 10%，对齐裁判标准。** 脚本末尾会自动列出最值得抽检的条目（两项分数差异大、或整体分偏低）。
+**最重要的操作：人工抽检 10%，对齐裁判标准。** 脚本末尾会自动列出 `faithfulness_score < 0.67` 且有未支持声明的条目。
 
 对齐流程：
-1. 阅读 `faithfulness_reason` — 若 Gemini 认为某句话"引用了外部知识"但你认为这在 Context 中有隐含依据，记录分歧
-2. 积累 3–5 条分歧样本后，修改 `judge_answers.py` 中的 `_JUDGE_PROMPT` 评分准则
+1. 阅读 `faithfulness_details` JSON — 找到 `YES: false` 的声明，判断 Gemini 是否误判
+2. 若 Gemini 把 Context 中有隐含依据的信息标为 NO，修改 `judge_answers.py` 中的 `_VERIFY_PROMPT` 验证标准
 3. 重新运行 `judge_answers.py`（不需要重跑 `generate_answers.py`，输入文件未变）
 4. 重复直到 Gemini 打分逻辑与你的判断基本一致
 
@@ -256,18 +258,20 @@ python eval/judge_answers.py
 
 | 现象 | 可能原因 |
 |------|---------|
-| Faithfulness 低但 Relevance 高 | 模型用自身知识补充了 Context 没说的细节（幻觉） |
+| Faithfulness 低但 Relevance 高 | 模型用自身知识补充了 Context 没说的细节（幻觉，`faithfulness_details` 可定位具体声明） |
 | Faithfulness 高但 Relevance 低 | 模型找到了 Context 中的相关句子但答非所问 |
 | 检索未命中（`hit_at_5=False`）时分数却高 | 模型在凭参数知识答题，检索完全没起作用 |
-| `completion_tokens` 很少但分数高 | 模型可能在重复问题而非作答，需人工确认 |
+| `faithfulness_claims_total = 0` | 答案为拒答（"根据所提供的资料，无法回答"），无原子声明 = 无幻觉，score=1.0，正常参与统计 |
 
 **输出：`eval_judge_summary.json`**
 
 ```json
 {
   "faithfulness_avg": 0.85,
-  "faithfulness_ge2": 0.90,    // ≥2/3 达标率，目标 > 85%
+  "faithfulness_ge067_pct": 0.90,    // ≥0.67 达标率（对应原子声明 2/3 支持），目标 > 85%
   "answer_relevance_avg": 0.78,
+  "claims_total_avg": 4.2,           // 平均每条答案分解出的原子声明数
+  "claims_supported_avg": 3.7,
   "by_retrieval_hit": {
     "hit":  { "faithfulness_avg": 0.91, "answer_relevance_avg": 0.83 },
     "miss": { "faithfulness_avg": 0.62, "answer_relevance_avg": 0.51 }

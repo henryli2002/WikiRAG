@@ -67,6 +67,11 @@ CAUSE_DESC = {
          "   请对比 Query / Target / Noise 三者文本，判断 Reranker 的误判原因。",
 }
 
+# ── 工具函数（模块级，供 _classify 和主循环共用） ─────────────────────
+
+def _int_or_none(v: str) -> int | None:
+    return int(v) if v not in ("", "None", None) else None
+
 CAUSE_ACTIONS = {
     "A": "建议决策：\n"
          "   1. 在前置链路引入 Query 重写（Query Rewriting）\n"
@@ -155,7 +160,7 @@ def print_summary(cause_counts: dict[str, int], n_total_bad: int, n_total: int) 
     for c in ("A", "B", "C"):
         cnt = cause_counts.get(c, 0)
         if cnt > 0:
-            print(f"    {CAUSE_LABELS[c]:<24s}: {cnt:3d} 条  ({cnt/n_total:.1%})")
+            print(f"    {CAUSE_LABELS[c]:<24s}: {cnt:3d} 条  ({cnt/n_total_bad:.1%})")
     print(SEP2)
 
 
@@ -164,9 +169,6 @@ def print_summary(cause_counts: dict[str, int], n_total_bad: int, n_total: int) 
 # ══════════════════════════════════════════════════════════════════════
 
 def _classify(row: dict) -> str:
-    def _int_or_none(v: str) -> int | None:
-        return int(v) if v not in ("", "None", None) else None
-
     vec_r     = _int_or_none(row.get("vec_rank", ""))
     bm25_r    = _int_or_none(row.get("bm25_rank", ""))
     inversion = str(row.get("reranker_inversion", "")).lower() == "true"
@@ -195,7 +197,7 @@ async def run(args):
     n_total = len(all_rows)
     bad_rows = [
         r for r in all_rows
-        if str(r.get("hit_at_5", "")).lower() in ("false", "0", "")
+        if str(r.get("hit_at_5", "")).lower() in ("false", "0", "", "none")
     ]
     print(f"[dump_bad_cases] 共 {n_total} 条，Hit@5 失败: {len(bad_rows)} 条")
 
@@ -254,9 +256,6 @@ async def run(args):
             query_id = row.get("query_id", "?")
             chunk_id = int(row["chunk_id"])
             query    = row.get("query", "")
-
-            def _int_or_none(v: str) -> int | None:
-                return int(v) if v not in ("", "None", None) else None
 
             target_ranks = {
                 "vec":      _int_or_none(row.get("vec_rank", "")),

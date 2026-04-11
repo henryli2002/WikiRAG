@@ -283,6 +283,10 @@ async def run_eval(args):
         await core.close()
 
     # ── 写逐条结果 ────────────────────────────────────────────────────
+    if not eval_rows:
+        print("❌ 没有成功处理的 query，跳过写入", file=sys.stderr)
+        sys.exit(1)
+
     os.makedirs(os.path.dirname(os.path.abspath(args.results)), exist_ok=True)
     fieldnames = list(eval_rows[0].to_csv_dict().keys())
     with open(args.results, "w", newline="", encoding="utf-8") as f:
