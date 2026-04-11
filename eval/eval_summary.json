@@ -1,0 +1,39 @@
+{
+  "n_total": 50,
+  "hit_at_1": 0.7,
+  "hit_at_5": 0.82,
+  "hit_at_10": 0.86,
+  "mrr_at_10": 0.7635,
+  "reranker_inversion_count": 0,
+  "reranker_inversion_rate": 0.0,
+  "bad_case_cause_counts": {
+    "A": 6,
+    "B": 3,
+    "C": 0
+  },
+  "latency_p50_ms": 3249.1,
+  "latency_p90_ms": 4037.0,
+  "latency_p99_ms": 4931.1,
+  "embed_p50_ms": 40.8,
+  "vector_p50_ms": 10.4,
+  "bm25_p50_ms": 19.6,
+  "rerank_p50_ms": 3180.9,
+  "adversarial_hit5_by_type": {
+    "none": {
+      "n": 35,
+      "hit5_rate": 0.8286
+    },
+    "missing_info": {
+      "n": 5,
+      "hit5_rate": 0.6
+    },
+    "synonym": {
+      "n": 5,
+      "hit5_rate": 0.8
+    },
+    "entity_ambiguity": {
+      "n": 5,
+      "hit5_rate": 1.0
+    }
+  }
+}
