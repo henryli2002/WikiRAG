@@ -146,6 +146,20 @@ def load_quality(ret_rows: list[dict], judge_rows: list[dict]) -> dict:
             )
             / n
         )
+        q["retrieval_hit"] = (
+            sum(
+                r.get("retrieval_hit", r.get("hit_at_5", "")).lower() not in ("false", "0", "")
+                for r in ret_rows
+            )
+            / n
+        )
+        q["hit_at_3"] = (
+            sum(
+                r.get("hit_at_3", "").lower() not in ("false", "0", "")
+                for r in ret_rows
+            )
+            / n
+        )
         q["hit_at_5"] = (
             sum(
                 r.get("hit_at_5", "").lower() not in ("false", "0", "")
@@ -174,14 +188,14 @@ def load_quality(ret_rows: list[dict], judge_rows: list[dict]) -> dict:
         q["cause_A"] = sum(
             1
             for r in ret_rows
-            if r.get("hit_at_5", "").lower() in ("false", "0")
+            if r.get("retrieval_hit", r.get("hit_at_5", "")).lower() in ("false", "0")
             and _flt(r, "vec_rank") < 0
             and _flt(r, "bm25_rank") < 0
         )
         q["cause_B"] = sum(
             1
             for r in ret_rows
-            if r.get("hit_at_5", "").lower() in ("false", "0")
+            if r.get("retrieval_hit", r.get("hit_at_5", "")).lower() in ("false", "0")
             and r.get("reranker_inversion", "").lower() != "true"
             and not (_flt(r, "vec_rank") < 0 and _flt(r, "bm25_rank") < 0)
         )
@@ -235,10 +249,10 @@ def load_quality(ret_rows: list[dict], judge_rows: list[dict]) -> dict:
             hit_j = [
                 r
                 for r in valid
-                if str(r.get("hit_at_5", "")).lower() not in ("false", "0", "")
+                if str(r.get("retrieval_hit", r.get("hit_at_5", ""))).lower() not in ("false", "0", "")
             ]
             miss_j = [
-                r for r in valid if str(r.get("hit_at_5", "")).lower() in ("false", "0")
+                r for r in valid if str(r.get("retrieval_hit", r.get("hit_at_5", ""))).lower() in ("false", "0")
             ]
             for label, subset in [("hit", hit_j), ("miss", miss_j)]:
                 if subset:
@@ -388,6 +402,9 @@ def print_report(
         print(f"\n  ┌─ 检索质量 {'─' * 52}┐")
         for label, key, fmt in [
             ("Hit@1", "hit_at_1", ".1%"),
+            ("Ret_Hit", "retrieval_hit", ".1%"),
+            ("Hit@1", "hit_at_1", ".1%"),
+            ("Hit@3", "hit_at_3", ".1%"),
             ("Hit@5", "hit_at_5", ".1%"),
             ("Hit@10", "hit_at_10", ".1%"),
             ("MRR@10", "mrr_at_10", ".4f"),

@@ -130,7 +130,7 @@ class JudgeRow:
     query_id: int
     query: str
     adversarial_type: str
-    hit_at_5: str
+    retrieval_hit: str
     generated_answer: str
 
     # ── Faithfulness（0-1 浮点，原子级） ────────────────────────────
@@ -166,7 +166,7 @@ class JudgeRow:
             "query_id": self.query_id,
             "query": self.query,
             "adversarial_type": self.adversarial_type,
-            "hit_at_5": self.hit_at_5,
+            "retrieval_hit": self.retrieval_hit,
             "generated_answer": self.generated_answer,
             "is_refusal": self.is_refusal,
             # Faithfulness
@@ -426,8 +426,8 @@ def compute_summary(rows: list[JudgeRow]) -> dict:
             "overall_avg": avg([r.overall_norm for r in subset if r.overall_norm >= 0]),
         }
 
-    hit_rows = [r for r in rows if str(r.hit_at_5).lower() not in ("false", "0", "")]
-    miss_rows = [r for r in rows if str(r.hit_at_5).lower() in ("false", "0")]
+    hit_rows = [r for r in rows if str(r.retrieval_hit).lower() not in ("false", "0", "")]
+    miss_rows = [r for r in rows if str(r.retrieval_hit).lower() in ("false", "0")]
 
     # 对抗类型分层
     adv: dict[str, list] = {}
@@ -697,7 +697,7 @@ def main():
         "query_id",
         "query",
         "adversarial_type",
-        "hit_at_5",
+        "retrieval_hit",
         "generated_answer",
         "is_refusal",
         "faithfulness_score",
@@ -759,7 +759,7 @@ def main():
                 query_id=query_id,
                 query=query,
                 adversarial_type=row.get("adversarial_type", ""),
-                hit_at_5=row.get("hit_at_5", ""),
+                retrieval_hit=row.get("retrieval_hit") or row.get("hit_at_5") or "",
                 generated_answer=answer,
                 is_refusal=is_refusal,
                 faithfulness_score=f_score,
@@ -790,7 +790,7 @@ def main():
                         query_id=int(r["query_id"]),
                         query=r["query"],
                         adversarial_type=r.get("adversarial_type", ""),
-                        hit_at_5=r.get("hit_at_5", ""),
+                        retrieval_hit=r.get("retrieval_hit") or r.get("hit_at_5") or "",
                         generated_answer=r.get("generated_answer", ""),
                         is_refusal=str(r.get("is_refusal", "")).lower() == "true",
                         faithfulness_score=float(r.get("faithfulness_score") or -1),

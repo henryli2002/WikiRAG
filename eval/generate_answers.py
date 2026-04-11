@@ -18,7 +18,7 @@ eval/generate_answers.py
   chunk_id            ground truth chunk（用于与 eval_results.csv 对照）
   query               实际使用的问题文本
   adversarial_type    对抗类型（""=正常样本）
-  hit_at_5            检索是否命中（直接由本次 pipeline 结果计算，无需外部文件）
+  retrieval_hit       检索是否命中 (基于当前 topk)（直接由本次 pipeline 结果计算，无需外部文件）
   retrieved_chunk_ids 实际召回的 chunk id（JSON 数组）
   retrieved_context   送入 LLM 的完整 Context 文本
   generated_answer    Qwen 9B 生成的答案
@@ -225,7 +225,7 @@ async def run(args):
         print(f"[generate_answers] {len(golden)} 条查询")
 
     # ── 初始化 RetrievalCore ──────────────────────────────────────────
-    core = RetrievalCore(verbose=False)
+    core = RetrievalCore(verbose=False, final_k=args.topk)
     core.load_models(warmup=True)
     await core.connect_db()
 
@@ -249,7 +249,7 @@ async def run(args):
             pr = await core.run_pipeline(query)
             t  = pr.timings
             context, chunk_ids = _format_context(pr.final)
-            hit5 = _hit_at_k(pr.final, chunk_id, 5)
+            retrieval_hit = _hit_at_k(pr.final, chunk_id, args.topk)
 
             # 生成
             try:
@@ -272,7 +272,7 @@ async def run(args):
                 "chunk_id":            chunk_id,
                 "query":               query,
                 "adversarial_type":    adv_type,
-                "hit_at_5":            str(hit5),
+                "retrieval_hit":     str(retrieval_hit),
                 "n_chunks":            len(chunk_ids),
                 "context_chars":       len(context),
                 "retrieved_chunk_ids": json.dumps(chunk_ids, ensure_ascii=False),
@@ -397,6 +397,7 @@ def main():
     parser.add_argument("--output",  default="eval/eval_answers.csv")
     parser.add_argument("--resume",  action="store_true",
                         help="读取已有 output，只补跑 gen_ms<0 或 answer 为空的失败条目")
+    parser.add_argument("--topk",    type=int, default=5, help="检索传递给生成层的 top-k 数量")
     parser.add_argument("--limit",   type=int, default=None,
                         help="只处理前 N 条（调试用）")
     args = parser.parse_args()

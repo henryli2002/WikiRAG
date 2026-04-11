@@ -53,7 +53,8 @@ class EvalRow:
 
     # ── 命中标记 ────────────────────────────────────────────────────
     hit_at_1:  bool   # final_rank == 1
-    hit_at_5:  bool   # final_rank <= 5（MMR 后的最终结果集）
+    hit_at_3:  bool
+    hit_at_5:  bool
     hit_at_10: bool   # reranked_rank <= 10（进了 reranker 输出 top-10）
 
     # ── 死因 C 自动标记 ─────────────────────────────────────────────
@@ -88,6 +89,7 @@ def compute_metrics(rows: list[EvalRow]) -> dict:
         return {"n_total": 0}
 
     hit1  = sum(r.hit_at_1  for r in rows) / n
+    hit3  = sum(r.hit_at_3  for r in rows) / n
     hit5  = sum(r.hit_at_5  for r in rows) / n
     hit10 = sum(r.hit_at_10 for r in rows) / n
 
@@ -142,6 +144,7 @@ def compute_metrics(rows: list[EvalRow]) -> dict:
     return {
         "n_total":                  n,
         "hit_at_1":                 round(hit1,  4),
+        "hit_at_3":                 round(hit3,  4),
         "hit_at_5":                 round(hit5,  4),
         "hit_at_10":                round(hit10, 4),
         "mrr_at_10":                round(mrr,   4),
@@ -169,6 +172,7 @@ def _print_summary(m: dict) -> None:
     print(f"  评测摘要  n={m['n_total']}")
     print(f"{'─' * 58}")
     print(f"  Hit@1   : {m['hit_at_1']:.1%}")
+    print(f"  Hit@3   : {m['hit_at_3']:.1%}")
     print(f"  Hit@5   : {m['hit_at_5']:.1%}   ← 检索生死线（送给 LLM 的物理底线）")
     print(f"  Hit@10  : {m['hit_at_10']:.1%}   ← reranker 输出 top-10 覆盖率")
     print(f"  MRR@10  : {m['mrr_at_10']:.4f}  ← 精排精准度综合指标")
@@ -220,7 +224,7 @@ async def run_eval(args):
     print(f"[run_retrieval_eval] 共 {len(golden)} 条有效记录")
 
     # ── 初始化检索核心 ────────────────────────────────────────────────
-    core = RetrievalCore(verbose=args.verbose)
+    core = RetrievalCore(verbose=args.verbose, final_k=10)
     core.load_models(warmup=True)
     await core.connect_db()
 
@@ -247,6 +251,7 @@ async def run_eval(args):
 
             # 命中标记
             hit1  = final_r is not None and final_r <= 1
+            hit3  = final_r is not None and final_r <= 3
             hit5  = final_r is not None and final_r <= 5
             hit10 = reranked_r is not None and reranked_r <= 10
 
@@ -258,7 +263,7 @@ async def run_eval(args):
                 query=query, adversarial_type=adv_type,
                 vec_rank=vec_r, bm25_rank=bm25_r, merged_rank=merged_r,
                 reranked_rank=reranked_r, final_rank=final_r,
-                hit_at_1=hit1, hit_at_5=hit5, hit_at_10=hit10,
+                hit_at_1=hit1, hit_at_3=hit3, hit_at_5=hit5, hit_at_10=hit10,
                 reranker_inversion=inversion,
                 embed_ms=round(t.embed_ms, 2),
                 vector_ms=round(t.vector_ms, 2),
