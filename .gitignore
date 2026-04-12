@@ -146,3 +146,4 @@ Thumbs.db
 # 本地数据目录（如果有）
 data/
 models/
+eval_old/

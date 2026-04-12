@@ -64,10 +64,6 @@ _USER_TEMPLATE = """\
 
 # ─── 工具函数（复用 eval/generate_answers.py 的逻辑） ────────────────
 
-def _hit_at_k(final_docs: list[dict], chunk_id: int, k: int) -> bool:
-    return any(doc["id"] == chunk_id for doc in final_docs[:k])
-
-
 def _format_context(docs: list[dict], max_chars_per_doc: int = 400) -> tuple[str, list[int]]:
     parts = []
     ids   = []
@@ -162,7 +158,7 @@ async def run(args):
         golden = list(csv.DictReader(f))
 
     for row in golden:
-        row["_query"] = (row.get("human_query") or row.get("generated_query", "")).strip()
+        row["_query"] = row.get("query", "").strip()
     golden = [r for r in golden if r["_query"]]
 
     if args.limit:
@@ -206,9 +202,7 @@ async def run(args):
     try:
         for i, g in enumerate(golden, 1):
             query_id = int(g["query_id"])
-            chunk_id = int(g["chunk_id"])
             query    = g["_query"]
-            adv_type = g.get("adversarial_type", "").strip()
 
             print(f"  [{i:3d}/{len(golden)}] qid={query_id:3d}  q={query[:45]}")
 
@@ -216,7 +210,6 @@ async def run(args):
             pr = await core.run_pipeline(query)
             t  = pr.timings
             context, chunk_ids = _format_context(pr.final)
-            hit5 = _hit_at_k(pr.final, chunk_id, 5)
 
             # 裸答生成（不传入 context）
             try:
@@ -233,10 +226,7 @@ async def run(args):
 
             rows.append({
                 "query_id":            query_id,
-                "chunk_id":            chunk_id,
                 "query":               query,
-                "adversarial_type":    adv_type,
-                "hit_at_5":            str(hit5),
                 "n_chunks":            len(chunk_ids),
                 "context_chars":       len(context),
                 "retrieved_chunk_ids": json.dumps(chunk_ids, ensure_ascii=False),

@@ -3,58 +3,13 @@
   "n_faith_valid": 50,
   "n_relevance_valid": 50,
   "n_ctx_precision_valid": 50,
-  "faithfulness_avg": 0.9428,
-  "faithfulness_ge067": 0.94,
-  "answer_relevance_avg": 0.7773,
-  "answer_relevance_ge067": 0.86,
-  "context_precision_avg": 0.312,
-  "context_precision_ge067": 0.08,
-  "overall_avg": 0.6774,
-  "avg_claims_per_answer": 2.98,
-  "by_retrieval_hit": {
-    "hit": {
-      "n": 41,
-      "faithfulness_avg": 0.9546,
-      "answer_relevance_avg": 0.7778,
-      "context_precision_avg": 0.3317,
-      "overall_avg": 0.688
-    },
-    "miss": {
-      "n": 9,
-      "faithfulness_avg": 0.8889,
-      "answer_relevance_avg": 0.7754,
-      "context_precision_avg": 0.2222,
-      "overall_avg": 0.6288
-    }
-  },
-  "by_adversarial_type": {
-    "entity_ambiguity": {
-      "n": 5,
-      "faithfulness_avg": 1.0,
-      "answer_relevance_avg": 0.7541,
-      "context_precision_avg": 0.44,
-      "overall_avg": 0.7314
-    },
-    "none": {
-      "n": 35,
-      "faithfulness_avg": 0.923,
-      "answer_relevance_avg": 0.7885,
-      "context_precision_avg": 0.28,
-      "overall_avg": 0.6638
-    },
-    "synonym": {
-      "n": 5,
-      "faithfulness_avg": 0.9667,
-      "answer_relevance_avg": 0.7198,
-      "context_precision_avg": 0.28,
-      "overall_avg": 0.6555
-    },
-    "missing_info": {
-      "n": 5,
-      "faithfulness_avg": 1.0,
-      "answer_relevance_avg": 0.7802,
-      "context_precision_avg": 0.44,
-      "overall_avg": 0.7401
-    }
-  }
+  "faithfulness_avg": 0.9149,
+  "faithfulness_ge067": 0.92,
+  "answer_relevance_avg": 0.8186,
+  "answer_relevance_ge067": 0.98,
+  "context_precision_avg": 0.744,
+  "context_precision_ge067": 0.64,
+  "overall_avg": 0.8258,
+  "avg_claims_per_answer": 9.66,
+  "refusal_rate": 0.12
 }

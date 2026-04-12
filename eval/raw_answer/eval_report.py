@@ -27,8 +27,6 @@ from eval.eval_report import main as _report_main
 def main():
     _defaults = {
         "--dir": "eval/raw_answer",
-        # 检索结果复用 eval/ 的（pipeline 完全一致）
-        "--ret-csv": "eval/eval_results.csv",
     }
 
     injected = []
