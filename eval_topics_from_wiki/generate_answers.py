@@ -1,17 +1,24 @@
 """
 eval/generate_answers.py
 ========================
-检索 + 生成。
+阶段二第一步：检索 + 生成。
 
 流程：
-  1. 读取 golden_dataset.csv（随机主题 query）
+  1. 读取 golden_dataset.csv（human_query 优先）
   2. 通过 RetrievalCore 检索 top-K chunks（直接调用模型，不走 HTTP）
   3. 将检索结果组装为 Context，调用 llama.cpp（Qwen 9B）生成答案
   4. 写入 eval_answers.csv，供 judge_answers.py 打分
 
+刻意选用 Qwen 9B 而非强模型：
+  小模型更依赖 Context，不会凭自身参数知识"绕过"检索直接答对，
+  从而让 Faithfulness / Answer Relevance 的测量更有区分度。
+
 输出 eval_answers.csv 列：
   query_id            唯一编号
-  query               问题文本
+  chunk_id            ground truth chunk（用于与 eval_results.csv 对照）
+  query               实际使用的问题文本
+  adversarial_type    对抗类型（""=正常样本）
+  retrieval_hit       检索是否命中 (基于当前 topk)（直接由本次 pipeline 结果计算，无需外部文件）
   retrieved_chunk_ids 实际召回的 chunk id（JSON 数组）
   retrieved_context   送入 LLM 的完整 Context 文本
   generated_answer    Qwen 9B 生成的答案
@@ -19,7 +26,7 @@ eval/generate_answers.py
 用法：
   python eval/generate_answers.py
   python eval/generate_answers.py --golden eval/golden_dataset.csv --limit 20
-  python eval/generate_answers.py --resume
+  python eval/generate_answers.py --resume   # 读取已有输出，只补跑失败条目
 """
 
 from __future__ import annotations
@@ -36,7 +43,7 @@ from dataclasses import dataclass
 from openai import OpenAI
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from eval.retrieval_core import RetrievalCore
+from eval_random_topics.retrieval_core import RetrievalCore
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -71,6 +78,11 @@ _USER_TEMPLATE = """\
 
 
 # ─── 工具函数 ─────────────────────────────────────────────────────────
+
+def _hit_at_k(final_docs: list[dict], chunk_id: int, k: int) -> bool:
+    """检查目标 chunk 是否出现在 final 结果的前 k 位。"""
+    return any(doc["id"] == chunk_id for doc in final_docs[:k])
+
 
 def _format_context(docs: list[dict], max_chars_per_doc: int = 400) -> tuple[str, list[int]]:
     """
@@ -183,7 +195,7 @@ async def run(args):
         golden = list(csv.DictReader(f))
 
     for row in golden:
-        row["_query"] = row.get("query", "").strip()
+        row["_query"] = (row.get("human_query") or row.get("generated_query", "")).strip()
     golden = [r for r in golden if r["_query"]]
 
     if args.limit:
@@ -227,7 +239,9 @@ async def run(args):
     try:
         for i, g in enumerate(golden, 1):
             query_id = int(g["query_id"])
+            chunk_id = int(g["chunk_id"])
             query    = g["_query"]
+            adv_type = g.get("adversarial_type", "").strip()
 
             print(f"  [{i:3d}/{len(golden)}] qid={query_id:3d}  q={query[:45]}")
 
@@ -235,6 +249,7 @@ async def run(args):
             pr = await core.run_pipeline(query)
             t  = pr.timings
             context, chunk_ids = _format_context(pr.final)
+            retrieval_hit = _hit_at_k(pr.final, chunk_id, args.topk)
 
             # 生成
             try:
@@ -254,7 +269,10 @@ async def run(args):
 
             rows.append({
                 "query_id":            query_id,
+                "chunk_id":            chunk_id,
                 "query":               query,
+                "adversarial_type":    adv_type,
+                "retrieval_hit":     str(retrieval_hit),
                 "n_chunks":            len(chunk_ids),
                 "context_chars":       len(context),
                 "retrieved_chunk_ids": json.dumps(chunk_ids, ensure_ascii=False),

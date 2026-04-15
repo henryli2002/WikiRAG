@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from openai import OpenAI
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
-from eval.retrieval_core import RetrievalCore
+from eval_random_topics.retrieval_core import RetrievalCore
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 

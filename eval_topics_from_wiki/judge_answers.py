@@ -129,6 +129,8 @@ _RELEVANCE_PROMPT = """\
 class JudgeRow:
     query_id: int
     query: str
+    adversarial_type: str
+    retrieval_hit: str
     generated_answer: str
 
     # ── Faithfulness（0-1 浮点，原子级） ────────────────────────────
@@ -163,6 +165,8 @@ class JudgeRow:
         return {
             "query_id": self.query_id,
             "query": self.query,
+            "adversarial_type": self.adversarial_type,
+            "retrieval_hit": self.retrieval_hit,
             "generated_answer": self.generated_answer,
             "is_refusal": self.is_refusal,
             # Faithfulness
@@ -396,9 +400,39 @@ def compute_summary(rows: list[JudgeRow]) -> dict:
     cp_scores = [r.context_precision_score for r in valid_cp]
     ov_scores = [r.overall_norm for r in valid]
 
-    # 拒答率
-    refusals = sum(1 for r in rows if r.is_refusal)
-    refusal_rate = round(refusals / n, 4) if n else 0.0
+    # 检索命中分层
+    def layer(subset):
+        if not subset:
+            return {}
+        return {
+            "n": len(subset),
+            "faithfulness_avg": avg(
+                [r.faithfulness_score for r in subset if r.faithfulness_score >= 0]
+            ),
+            "answer_relevance_avg": avg(
+                [
+                    r.answer_relevance_score
+                    for r in subset
+                    if r.answer_relevance_score >= 0
+                ]
+            ),
+            "context_precision_avg": avg(
+                [
+                    r.context_precision_score
+                    for r in subset
+                    if r.context_precision_score >= 0
+                ]
+            ),
+            "overall_avg": avg([r.overall_norm for r in subset if r.overall_norm >= 0]),
+        }
+
+    hit_rows = [r for r in rows if str(r.retrieval_hit).lower() not in ("false", "0", "")]
+    miss_rows = [r for r in rows if str(r.retrieval_hit).lower() in ("false", "0")]
+
+    # 对抗类型分层
+    adv: dict[str, list] = {}
+    for r in rows:
+        adv.setdefault(r.adversarial_type or "none", []).append(r)
 
     return {
         "n_total": n,
@@ -413,7 +447,11 @@ def compute_summary(rows: list[JudgeRow]) -> dict:
         "context_precision_ge067": pct_ge(cp_scores, 0.67),
         "overall_avg": avg(ov_scores),
         "avg_claims_per_answer": avg([r.faithfulness_claims_total for r in valid_f]),
-        "refusal_rate": refusal_rate,
+        "by_retrieval_hit": {
+            "hit": layer(hit_rows),
+            "miss": layer(miss_rows),
+        },
+        "by_adversarial_type": {t: layer(v) for t, v in adv.items()},
     }
 
 
@@ -460,7 +498,32 @@ def _print_summary(m: dict) -> None:
         f"≥0.67达标率={m.get('context_precision_ge067', 0):.1%}"
     )
     print(f"  Overall         avg={m['overall_avg']:.3f}")
-    print(f"  拒答率          {m.get('refusal_rate', 0):.1%}")
+
+    hit = m["by_retrieval_hit"].get("hit", {})
+    miss = m["by_retrieval_hit"].get("miss", {})
+    if hit or miss:
+        print(f"\n  检索命中 vs 未命中：")
+        for label, stat in [("命中  ", hit), ("未命中", miss)]:
+            if stat:
+                print(
+                    f"    {label}(n={stat.get('n', 0):2d})  "
+                    f"Faith={stat.get('faithfulness_avg', 0):.3f}  "
+                    f"Rel={stat.get('answer_relevance_avg', 0):.3f}  "
+                    f"CtxPrec={stat.get('context_precision_avg', 0):.3f}  "
+                    f"Overall={stat.get('overall_avg', 0):.3f}"
+                )
+
+    adv = m.get("by_adversarial_type", {})
+    if adv:
+        print(f"\n  对抗类型分层：")
+        for t, stat in adv.items():
+            if stat:
+                print(
+                    f"    {t:<22s}  Faith={stat.get('faithfulness_avg', 0):.3f}  "
+                    f"Rel={stat.get('answer_relevance_avg', 0):.3f}  "
+                    f"CtxPrec={stat.get('context_precision_avg', 0):.3f}  "
+                    f"(n={stat.get('n', 0)})"
+                )
     print(f"{SEP}\n")
 
 
@@ -474,7 +537,8 @@ def _print_spot_check(cases: list[JudgeRow]) -> None:
         print(
             f"\n  [qid={r.query_id}]  "
             f"Faith={r.faithfulness_score:.2f}({r.faithfulness_claims_supported}/{r.faithfulness_claims_total})  "
-            f"Rel={r.answer_relevance_score:.2f}"
+            f"Rel={r.answer_relevance_score:.2f}  "
+            f"adv={r.adversarial_type or 'none'}"
         )
         print(f"  Q: {r.query[:70]}")
         print(f"  A: {r.generated_answer[:100]}...")
@@ -618,7 +682,7 @@ def main():
     # BGE-M3 用于 Answer Relevance 余弦相似度计算
     try:
         from FlagEmbedding import BGEM3FlagModel
-        from eval.retrieval_core import EMBEDDING_MODEL_PATH
+        from eval_random_topics.retrieval_core import EMBEDDING_MODEL_PATH
 
         print("[judge_answers] 加载 BGE-M3 embedding 模型...")
         embed_model = BGEM3FlagModel(EMBEDDING_MODEL_PATH, use_fp16=True)
@@ -632,6 +696,8 @@ def main():
     _FIELDNAMES = [
         "query_id",
         "query",
+        "adversarial_type",
+        "retrieval_hit",
         "generated_answer",
         "is_refusal",
         "faithfulness_score",
@@ -692,6 +758,8 @@ def main():
             jr = JudgeRow(
                 query_id=query_id,
                 query=query,
+                adversarial_type=row.get("adversarial_type", ""),
+                retrieval_hit=row.get("retrieval_hit") or row.get("hit_at_5") or "",
                 generated_answer=answer,
                 is_refusal=is_refusal,
                 faithfulness_score=f_score,
@@ -721,6 +789,8 @@ def main():
                     JudgeRow(
                         query_id=int(r["query_id"]),
                         query=r["query"],
+                        adversarial_type=r.get("adversarial_type", ""),
+                        retrieval_hit=r.get("retrieval_hit") or r.get("hit_at_5") or "",
                         generated_answer=r.get("generated_answer", ""),
                         is_refusal=str(r.get("is_refusal", "")).lower() == "true",
                         faithfulness_score=float(r.get("faithfulness_score") or -1),

@@ -1,0 +1,3 @@
+query_id,chunk_id,query,adversarial_type,vec_rank,bm25_rank,merged_rank,reranked_rank,final_rank,hit_at_1,hit_at_3,hit_at_5,hit_at_10,reranker_inversion,embed_ms,vector_ms,bm25_ms,merge_ms,rerank_ms,mmr_ms,total_ms
+1,2411822,京包铁路的包头枢纽环线和宣化大林堡支线这两项工程，在最终的建成结果上有什么不同？,,1,13,4,1,1,True,True,True,True,False,274.8,34.71,57.82,0.03,3800.93,0.0,4133.58
+2,2256309,小田切龙和山口久美子分别是干什么的？,missing_info,,2,5,1,1,True,True,True,True,False,40.77,25.38,21.77,0.03,4409.5,0.01,4475.69

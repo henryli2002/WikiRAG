@@ -18,7 +18,7 @@ import os
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
-from eval.judge_answers import main as _judge_main
+from eval_random_topics.judge_answers import main as _judge_main
 import argparse
 
 
