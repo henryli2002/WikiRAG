@@ -1,0 +1,15 @@
+{
+  "n_total": 50,
+  "n_faith_valid": 50,
+  "n_relevance_valid": 50,
+  "n_ctx_precision_valid": 50,
+  "faithfulness_avg": 0.9478,
+  "faithfulness_ge067": 0.94,
+  "answer_relevance_avg": 0.8495,
+  "answer_relevance_ge067": 1.0,
+  "context_precision_avg": 0.94,
+  "context_precision_ge067": 0.94,
+  "overall_avg": 0.9124,
+  "avg_claims_per_answer": 9.18,
+  "refusal_rate": 0.12
+}
