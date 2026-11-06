@@ -147,3 +147,10 @@ Thumbs.db
 data/
 models/
 eval_old/
+
+# Rebuildable local caches
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+.venv/
+!requirements.lock
